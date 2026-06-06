@@ -33,8 +33,8 @@ test("buildTarget: appends remainder and preserves query", () => {
 });
 
 test("buildRoutes: --upstream becomes a route at its own path; bad --route throws", () => {
-  assert.deepEqual(routeFromUpstream("http://h:3/mcp"), { prefix: "/mcp", upstream: "http://h:3/mcp" });
-  assert.deepEqual(routeFromUpstream("http://h:3"), { prefix: "/", upstream: "http://h:3" });
+  assert.deepEqual(routeFromUpstream("http://h:3/mcp"), { prefix: "/mcp", upstream: "http://h:3/mcp", forwardCredentials: true });
+  assert.deepEqual(routeFromUpstream("http://h:3"), { prefix: "/", upstream: "http://h:3", forwardCredentials: true });
   const rs = buildRoutes("http://h:3/mcp", ["/gh=http://h:4/mcp"]);
   assert.equal(rs.length, 2);
   assert.throws(() => buildRoutes(undefined, ["no-equals"]), /bad --route/);

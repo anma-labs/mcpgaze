@@ -4,17 +4,50 @@ import { shapeOf, diffShape } from "./shape";
 import type { Change } from "./schema-diff";
 import { PROTOCOL_VERSION } from "./client";
 import { VERSION } from "./version";
-import type { Cassette, Interaction } from "./cassette";
+import { parseCassette, type Interaction } from "./cassette";
 
 export interface VerifyResult {
   checked: number;
   changes: Array<Change & { method: string }>;
   errors: Array<{ method: string; message: string }>;
+  /** Verifiable state-changing methods skipped because re-issuing them wasn't opted into. */
+  skipped: string[];
 }
 
-/** Methods we don't re-issue: handshake + fire-and-forget notifications. */
+export interface VerifyOptions {
+  timeoutMs?: number;
+  /**
+   * The cassette is untrusted JSON: its method/params are re-issued verbatim to
+   * the live server. By default we re-issue only read-only methods; opt in to
+   * also re-issue state-changing calls (tools/call, etc).
+   */
+  allowToolCalls?: boolean;
+}
+
+/** Read-only MCP methods that are safe to re-issue from an untrusted cassette. */
+const READ_ONLY_METHODS = new Set([
+  "tools/list",
+  "resources/list",
+  "resources/templates/list",
+  "prompts/list",
+  "ping",
+  "completion/complete",
+]);
+
+/** Methods we never re-issue: handshake + fire-and-forget notifications. */
 function isVerifiable(method: string): boolean {
   return method !== "initialize" && !method.startsWith("notifications/");
+}
+
+/**
+ * Whether to re-issue this recorded method against the live server. State-
+ * changing methods (anything outside the read-only allow-list) are skipped
+ * unless the operator opts in — a hostile cassette must not be able to drive
+ * arbitrary tools/call or resources/read at the live server through verify.
+ */
+function shouldReissue(method: string, allowToolCalls: boolean): boolean {
+  if (!isVerifiable(method)) return false;
+  return allowToolCalls || READ_ONLY_METHODS.has(method);
 }
 
 /**
@@ -30,10 +63,12 @@ export async function verify(
   args: string[],
   cassettePath: string,
   timeoutMs = 15000,
+  opts: VerifyOptions = {},
 ): Promise<VerifyResult> {
-  const cassette = JSON.parse(readFileSync(cassettePath, "utf8")) as Cassette;
+  const allowToolCalls = Boolean(opts.allowToolCalls);
+  const cassette = parseCassette(readFileSync(cassettePath, "utf8"));
   const conn = McpConnection.spawn(command, args);
-  const result: VerifyResult = { checked: 0, changes: [], errors: [] };
+  const result: VerifyResult = { checked: 0, changes: [], errors: [], skipped: [] };
 
   try {
     const init = await conn.request(
@@ -47,6 +82,10 @@ export async function verify(
     for (const it of cassette.interactions as Interaction[]) {
       const method = it.request.method;
       if (!isVerifiable(method)) continue;
+      if (!shouldReissue(method, allowToolCalls)) {
+        result.skipped.push(method); // state-changing + not opted in
+        continue;
+      }
       result.checked++;
 
       let live;
@@ -96,8 +135,10 @@ export async function updateCassette(
   args: string[],
   cassettePath: string,
   timeoutMs = 15000,
+  opts: VerifyOptions = {},
 ): Promise<number> {
-  const cassette = JSON.parse(readFileSync(cassettePath, "utf8")) as Cassette;
+  const allowToolCalls = Boolean(opts.allowToolCalls);
+  const cassette = parseCassette(readFileSync(cassettePath, "utf8"));
   const conn = McpConnection.spawn(command, args);
   let updated = 0;
   try {
@@ -110,7 +151,7 @@ export async function updateCassette(
     conn.notify("notifications/initialized");
 
     for (const it of cassette.interactions as Interaction[]) {
-      if (!isVerifiable(it.request.method)) continue;
+      if (!shouldReissue(it.request.method, allowToolCalls)) continue;
       const live = await conn.request(it.request.method, it.request.params, timeoutMs);
       it.response = live.error ? { error: live.error } : { result: live.result };
       updated++;
@@ -127,7 +168,7 @@ export async function updateCassette(
         `failed to serialize updated cassette (a live response is too deeply nested): ${(e as Error).message}`,
       );
     }
-    writeFileSync(cassettePath, serialized);
+    writeFileSync(cassettePath, serialized, { mode: 0o600 }); // see CassetteRecorder.write
     return updated;
   } finally {
     conn.close();

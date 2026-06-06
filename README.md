@@ -103,16 +103,21 @@ mcpgaze wrap-http --port 7000 \
 
 Security defaults, baked in: binds to `127.0.0.1` only, and rejects cross-origin browser requests (DNS-rebinding defense — the class of bug behind the Inspector's CVE-2025-49596). `--host` and `--allow-origin` override, with a warning.
 
+**Credential scoping.** A single `--upstream`/`--route` forwards the client's `Authorization`/`Cookie` to that one upstream — there's only one destination, so a token can't be misrouted; pass `--no-forward-credentials` to strip them anyway. With **multiple** `--route`s a path could resolve to a different upstream than the client meant to authenticate to, so credentials — and `Set-Cookie`/`Mcp-Session-Id` on the way back — are **stripped unless that route opts in**: `--creds-route /github` per route, or `--forward-credentials` for all.
+
 ## `record` + `replay` — VCR for MCP
 
 Record a real session into a cassette, then replay it as a deterministic mock server with no backend — for offline client development and regression CI.
 
 ```bash
 mcpgaze record --cassette s.json -- node server.js   # wrap + capture req/res pairs
+mcpgaze record --cassette s.json --redact -- node ... # mask credential-shaped params/results
 mcpgaze replay --cassette s.json                      # serve those pairs over stdio
 ```
 
 Replay matches requests by method + params (exact first, then a unique method-only fallback) and returns a clear JSON-RPC error for anything unrecorded instead of hanging. Verified: replayed responses are byte-identical to the originals.
+
+A cassette stores request params and response results **verbatim**, so it can contain secrets (tokens, passwords, DSNs) the session carried. Cassettes are written `0600` and `*.cassette.json` is git-ignored by default — record with `--redact` and review a cassette before committing or sharing it. `verify` re-issues a cassette's methods against a live server; only read-only methods are re-issued unless you pass `--allow-tool-calls`.
 
 ## `preflight` — catch the env vars a GUI client won't inherit
 

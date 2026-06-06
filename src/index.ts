@@ -40,6 +40,14 @@ function hasFlag(opts: string[], name: string): boolean {
   return opts.includes(name);
 }
 
+/** Parse an optional positive-integer millisecond value from a flag/env value. */
+function parseTimeoutOpt(raw: string | undefined, name: string): number | undefined {
+  if (raw === undefined) return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) die(`${name} must be a positive number of milliseconds (got "${raw}")`);
+  return n;
+}
+
 function die(msg: string): never {
   process.stderr.write(color.red(msg) + "\n");
   process.exit(2);
@@ -49,20 +57,35 @@ function timestamp(): string {
   return new Date().toISOString().replace(/[:.]/g, "-");
 }
 
+/** One-shot interactive [y/N] prompt on stderr; resolves true only on an explicit yes. */
+function promptYesNo(question: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    process.stderr.write(question);
+    const onData = (chunk: Buffer): void => {
+      process.stdin.pause();
+      process.stdin.off("data", onData);
+      resolve(/^y(es)?$/i.test(chunk.toString("utf8").trim()));
+    };
+    process.stdin.resume();
+    process.stdin.once("data", onData);
+  });
+}
+
 const HELP = `mcpgaze v${VERSION} — a transparent wiretap for MCP servers
 
 USAGE
-  mcpgaze wrap [--log <path>] [--print] [--tui] [--native] -- <server command...>
+  mcpgaze wrap [--log <path>] [--print] [--redact] [--tui] [--native] -- <server command...>
   mcpgaze wrap-http (--upstream <url> | --route <prefix>=<url> ...) [--port <n>] [--host 127.0.0.1]
-  mcpgaze record [--cassette mcpgaze.cassette.json] [--log <path>] -- <server command...>
+                    [--forward-credentials | --creds-route <prefix> ... | --no-forward-credentials] [--redact]
+  mcpgaze record [--cassette mcpgaze.cassette.json] [--log <path>] [--no-redact] -- <server command...>
   mcpgaze replay --cassette <file>
   mcpgaze snapshot [--out mcpgaze.baseline.json] -- <server command...>
   mcpgaze diff [--baseline <f>] [--fail-on <breaking|warning|any>] [--update] -- <server command...>
   mcpgaze conform [--spec <ver>|--all] [--json] -- <server command...>
-  mcpgaze verify --cassette <file> [--fail-on <sev>] [--update] -- <server command...>
+  mcpgaze verify --cassette <file> [--fail-on <sev>] [--update] [--allow-tool-calls] -- <server command...>
   mcpgaze health [--interval <sec>] [--once] [--status <path>] -- <server command...>
-  mcpgaze triage [--log <session.jsonl>] [--ai] [--model <name>]
-  mcpgaze preflight [--config <file> [--server <name>]] [-- <server command...>]
+  mcpgaze triage [--log <session.jsonl>] [--ai] [--yes] [--model <name>]
+  mcpgaze preflight [--config <file> [--server <name>]] [--timeout <ms>] [-- <server command...>]
 
 COMMANDS
   wrap        Transparent stdio proxy; logs every JSON-RPC message to a side
@@ -71,13 +94,21 @@ COMMANDS
   wrap-http   Same idea for Streamable HTTP: localhost-bound, Origin-checked.
               Routes by path prefix, so one proxy can front several upstreams
               (--route /a=URL --route /b=URL); --upstream is the single-route form.
+              A single --upstream/--route forwards the client's Authorization/
+              Cookie to that one upstream (one destination, nothing to misroute);
+              add --no-forward-credentials to strip them. With MULTIPLE routes a
+              token could reach the wrong upstream, so credentials are stripped
+              unless a route opts in (--creds-route /a, or --forward-credentials).
   record      Wrap a server and write a replayable cassette of req/res pairs.
+              Secrets are redacted by default (it is a shareable artifact);
+              pass --no-redact to capture params/results/stderr verbatim.
   replay      Deterministic mock MCP server (stdio) from a cassette.
   snapshot    Probe the server, write a tool-schema baseline you commit to git.
   diff        Diff the live tool surface vs the baseline. --update accepts it.
   conform     Spec-conformance suite across protocol versions.
   verify      Re-issue recorded requests and diff RESPONSE SHAPES. --update
               re-baselines the cassette (accept intentional behavioral changes).
+              Only read-only methods are re-issued unless --allow-tool-calls.
   health      Continuously health-check a server (uptime, latency, drift), or
               --once as a cron/CI liveness probe (exit 0 up / 1 down).
   triage      Read a session log, surface failures, and (with --ai) get a
@@ -132,6 +163,7 @@ async function cmdWrap(args: string[]): Promise<void> {
     jsonlPath: logPath,
     pretty: !tui && hasFlag(opts, "--print"),
     onEvent: tui ? (ev) => tui.update(ev) : undefined,
+    redact: hasFlag(opts, "--redact"),
   });
 
   if (tui) {
@@ -158,9 +190,17 @@ async function cmdWrapHttp(args: string[]): Promise<void> {
   if (!upstream && routeSpecs.length === 0) {
     die("usage: mcpgaze wrap-http (--upstream <url> | --route <prefix>=<url> ...) [--port <n>] [--host 127.0.0.1]");
   }
+  const noForwardCredentials = hasFlag(opts, "--no-forward-credentials");
+  if (noForwardCredentials && (hasFlag(opts, "--forward-credentials") || getOpts(opts, "--creds-route").length > 0)) {
+    die("--no-forward-credentials cannot be combined with --forward-credentials or --creds-route");
+  }
   let routes;
   try {
-    routes = buildRoutes(upstream, routeSpecs);
+    routes = buildRoutes(upstream, routeSpecs, {
+      forwardCredentials: hasFlag(opts, "--forward-credentials"),
+      credsPrefixes: getOpts(opts, "--creds-route"),
+      noForwardCredentials,
+    });
   } catch (e) {
     die((e as Error).message);
   }
@@ -168,7 +208,7 @@ async function cmdWrapHttp(args: string[]): Promise<void> {
   const port = Number(getOpt(opts, "--port") ?? "0");
   const logPath = getOpt(opts, "--log") ?? `.mcpgaze/session-${timestamp()}.jsonl`;
   const allow = getOpt(opts, "--allow-origin");
-  const logger = new Logger({ jsonlPath: logPath, pretty: hasFlag(opts, "--print") });
+  const logger = new Logger({ jsonlPath: logPath, pretty: hasFlag(opts, "--print"), redact: hasFlag(opts, "--redact") });
   const handle = await runHttpProxy({
     routes,
     host,
@@ -194,9 +234,18 @@ async function cmdRecord(args: string[]): Promise<void> {
   if (cmd.length === 0) die("usage: mcpgaze record [--cassette <path>] -- <server command...>");
   const cassettePath = getOpt(opts, "--cassette") ?? "mcpgaze.cassette.json";
   const logPath = getOpt(opts, "--log") ?? `.mcpgaze/session-${timestamp()}.jsonl`;
-  const logger = new Logger({ jsonlPath: logPath, pretty: hasFlag(opts, "--print") });
-  const recorder = new CassetteRecorder();
+  // A cassette is a shareable/committable artifact, so `record` redacts secrets
+  // by default (unlike wrap/wrap-http, where redaction is opt-in to preserve the
+  // exact-bytes debug view). --no-redact restores verbatim capture.
+  const redact = !hasFlag(opts, "--no-redact");
+  const logger = new Logger({ jsonlPath: logPath, pretty: hasFlag(opts, "--print"), redact });
+  const recorder = new CassetteRecorder(redact);
   process.stderr.write(color.dim(`[mcpgaze] recording cassette to ${cassettePath}\n`));
+  process.stderr.write(
+    redact
+      ? color.dim("[mcpgaze] secret redaction ON (cassette + log); pass --no-redact to capture verbatim\n")
+      : color.yellow("[mcpgaze] --no-redact: secrets in params/results/stderr will be stored verbatim\n"),
+  );
   const code = await runProxy({
     command: cmd[0],
     args: cmd.slice(1),
@@ -233,9 +282,12 @@ async function cmdPreflight(args: string[]): Promise<void> {
     if (cmd.length === 0) return;
   }
 
-  if (cmd.length === 0) die("usage: mcpgaze preflight [--config <file>] [-- <server command...>]");
+  if (cmd.length === 0) die("usage: mcpgaze preflight [--config <file>] [--timeout <ms>] [-- <server command...>]");
+  // --timeout (or MCPGAZE_PREFLIGHT_TIMEOUT) overrides the handshake budget;
+  // preflight defaults to the shared probe timeout when unset.
+  const timeoutMs = parseTimeoutOpt(getOpt(opts, "--timeout") ?? process.env.MCPGAZE_PREFLIGHT_TIMEOUT, "--timeout");
   process.stderr.write(color.dim("[mcpgaze] probing with full env, then with the GUI-inherited subset…\n"));
-  const r = await preflight(cmd[0], cmd.slice(1));
+  const r = await preflight(cmd[0], cmd.slice(1), timeoutMs !== undefined ? { timeoutMs } : {});
 
   if (!r.fullEnvOk) {
     process.stdout.write(color.red("✗ the server failed to start even with your full environment.\n"));
@@ -363,17 +415,27 @@ async function cmdConform(args: string[]): Promise<void> {
 async function cmdVerify(args: string[]): Promise<void> {
   const { opts, cmd } = splitOnDoubleDash(args);
   const cassette = getOpt(opts, "--cassette");
-  if (!cassette || cmd.length === 0) die("usage: mcpgaze verify --cassette <file> [--update] -- <server command...>");
+  if (!cassette || cmd.length === 0) die("usage: mcpgaze verify --cassette <file> [--update] [--allow-tool-calls] -- <server command...>");
+
+  // The cassette's methods are untrusted and re-issued verbatim to the live
+  // server. Re-issue only read-only methods unless the operator opts in.
+  const allowToolCalls = hasFlag(opts, "--allow-tool-calls");
 
   if (hasFlag(opts, "--update")) {
-    const n = await updateCassette(cmd[0], cmd.slice(1), cassette);
+    const n = await updateCassette(cmd[0], cmd.slice(1), cassette, undefined, { allowToolCalls });
     process.stdout.write(color.green(`✓ cassette re-baselined`) + ` — ${n} response(s) accepted into ${cassette}\n`);
     return;
   }
 
   const failOn = getOpt(opts, "--fail-on");
-  const r = await verify(cmd[0], cmd.slice(1), cassette);
+  const r = await verify(cmd[0], cmd.slice(1), cassette, undefined, { allowToolCalls });
   process.stdout.write(color.dim(`re-issued ${r.checked} recorded request(s)\n`));
+  if (r.skipped.length > 0) {
+    const uniq = [...new Set(r.skipped)];
+    process.stdout.write(
+      color.dim(`skipped ${r.skipped.length} state-changing request(s) [${uniq.join(", ")}] — pass --allow-tool-calls to re-issue\n`),
+    );
+  }
   for (const e of r.errors) process.stdout.write(`  ${color.red("ERROR   ")}  ${color.bold(e.method)} — ${e.message}\n`);
 
   if (r.changes.length === 0 && r.errors.length === 0) {
@@ -432,11 +494,23 @@ async function cmdHealth(args: string[]): Promise<void> {
 async function cmdTriage(args: string[]): Promise<void> {
   const { opts } = splitOnDoubleDash(args);
   const logPath = getOpt(opts, "--log");
-  if (!logPath) die("usage: mcpgaze triage --log <session.jsonl> [--ai] [--model <name>]");
+  if (!logPath) die("usage: mcpgaze triage --log <session.jsonl> [--ai] [--yes] [--model <name>]");
+  const preConsented = hasFlag(opts, "--yes");
   const report = await triage(logPath, {
     useAi: hasFlag(opts, "--ai"),
     apiKey: process.env.ANTHROPIC_API_KEY,
     model: getOpt(opts, "--model") ?? process.env.MCPGAZE_TRIAGE_MODEL,
+    // --ai egresses (redacted) failure details to api.anthropic.com. Require an
+    // explicit acknowledgement: --yes, or a "y" at the interactive preview.
+    confirmEgress: async (prompt) => {
+      if (preConsented) return true;
+      if (!process.stdin.isTTY) return false; // non-interactive without --yes: don't send
+      process.stderr.write(
+        color.yellow("\n[mcpgaze] triage --ai will POST these (redacted) failure details to api.anthropic.com:\n") +
+          color.dim(prompt.split("\n").map((l) => "  " + l).join("\n") + "\n"),
+      );
+      return await promptYesNo("Send to Anthropic? [y/N] ");
+    },
   });
 
   if (report.failures.length === 0) {

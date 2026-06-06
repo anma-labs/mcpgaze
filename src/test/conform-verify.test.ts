@@ -48,7 +48,8 @@ test("verify: matching server reports no behavioral drift", async () => {
   const p = join(tmpdir(), `cass-${Date.now()}-a.json`);
   writeCassette(p);
   try {
-    const r = await verify("node", [TOOL], p, 4000);
+    // tools/call is state-changing, so re-issuing it requires the opt-in.
+    const r = await verify("node", [TOOL], p, 4000, { allowToolCalls: true });
     assert.equal(r.checked, 1); // initialize is skipped
     assert.equal(r.changes.length, 0, JSON.stringify(r.changes));
   } finally {
@@ -62,7 +63,7 @@ test("verify: drift detected when MOCK_DRIFT=1", async () => {
   const prev = process.env.MOCK_DRIFT;
   process.env.MOCK_DRIFT = "1";
   try {
-    const r = await verify("node", [TOOL], p, 4000);
+    const r = await verify("node", [TOOL], p, 4000, { allowToolCalls: true });
     assert.equal(r.checked, 1);
     assert.ok(r.changes.some((c) => c.severity === "breaking" && /field removed/.test(c.message)), "total removed -> breaking");
     assert.ok(r.changes.some((c) => c.severity === "warning" && /now empty/.test(c.message)), "results emptied -> warning");

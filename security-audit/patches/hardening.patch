@@ -1,0 +1,707 @@
+diff --git a/.gitignore b/.gitignore
+index fedb2c1..edb8085 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -5,3 +5,7 @@ dist/
+ .DS_Store
+ native/**/target/
+ Cargo.lock
++# Cassettes can capture request params / response results verbatim — don't
++# commit them by default (record with --redact, or curate before sharing).
++mcpgaze.cassette.json
++*.cassette.json
+diff --git a/README.md b/README.md
+index d85dd40..52d3643 100644
+--- a/README.md
++++ b/README.md
+@@ -109,11 +109,14 @@ Record a real session into a cassette, then replay it as a deterministic mock se
+ 
+ ```bash
+ mcpgaze record --cassette s.json -- node server.js   # wrap + capture req/res pairs
++mcpgaze record --cassette s.json --redact -- node ... # mask credential-shaped params/results
+ mcpgaze replay --cassette s.json                      # serve those pairs over stdio
+ ```
+ 
+ Replay matches requests by method + params (exact first, then a unique method-only fallback) and returns a clear JSON-RPC error for anything unrecorded instead of hanging. Verified: replayed responses are byte-identical to the originals.
+ 
++A cassette stores request params and response results **verbatim**, so it can contain secrets (tokens, passwords, DSNs) the session carried. Cassettes are written `0600` and `*.cassette.json` is git-ignored by default — record with `--redact` and review a cassette before committing or sharing it. `verify` re-issues a cassette's methods against a live server; only read-only methods are re-issued unless you pass `--allow-tool-calls`.
++
+ ## `preflight` — catch the env vars a GUI client won't inherit
+ 
+ GUI apps (Claude Desktop, etc.) do **not** inherit your shell environment — so a server that works in your terminal fails silently in production. `preflight` spawns the server twice, once with your full env and once with only the GUI-inherited subset, and tells you which vars matter:
+diff --git a/src/cassette.ts b/src/cassette.ts
+index be1d9fc..369612e 100644
+--- a/src/cassette.ts
++++ b/src/cassette.ts
+@@ -1,6 +1,7 @@
+ import { writeFileSync, readFileSync } from "node:fs";
+ import { LineFramer } from "./framer";
+ import { VERSION } from "./version";
++import { redactValue } from "./redact";
+ import type { PairedRequest, PairedResponse } from "./proxy";
+ 
+ export interface Interaction {
+@@ -38,10 +39,16 @@ export class CassetteRecorder {
+   private readonly interactions: Interaction[] = [];
+   private readonly seen = new Set<string>();
+ 
++  /** When true, mask credential-shaped params/results before they are persisted. */
++  constructor(private readonly redact = false) {}
++
+   add(request: PairedRequest, response: PairedResponse): void {
++    const params = this.redact ? redactValue(request.params) : request.params;
+     const interaction: Interaction = {
+-      request: { method: request.method, params: request.params },
+-      response: response.error ? { error: response.error } : { result: response.result },
++      request: { method: request.method, params },
++      response: response.error
++        ? { error: this.redact ? (redactValue(response.error) as Interaction["response"]["error"]) : response.error }
++        : { result: this.redact ? redactValue(response.result) : response.result },
+     };
+     const key = stableStringify(interaction);
+     if (this.seen.has(key)) return;
+@@ -58,7 +65,10 @@ export class CassetteRecorder {
+   }
+ 
+   write(path: string): number {
+-    writeFileSync(path, JSON.stringify(this.toCassette(), null, 2) + "\n");
++    // 0600: a cassette stores request params and response results verbatim and
++    // its default path is a non-gitignored repo-root file, so it must not be
++    // group/world-readable (umask 0022 would otherwise leave it 0644).
++    writeFileSync(path, JSON.stringify(this.toCassette(), null, 2) + "\n", { mode: 0o600 });
+     return this.interactions.length;
+   }
+ }
+@@ -112,9 +122,18 @@ function pickMethodOnly(index: CassetteIndex, method: string): Interaction | und
+  * a real session once, replay it forever in CI or for offline client dev.
+  */
+ export function runReplayServer(cassettePath: string): Promise<number> {
+-  return new Promise((resolve) => {
+-    const cassette = JSON.parse(readFileSync(cassettePath, "utf8")) as Cassette;
+-    const index = buildIndex(cassette);
++  return new Promise((resolve, reject) => {
++    // The cassette is an untrusted file. Parse + shape-validate up front so a
++    // malformed/hostile cassette fails with a clean error instead of an
++    // uncaught throw mid-startup.
++    let index: CassetteIndex;
++    try {
++      const cassette = parseCassette(readFileSync(cassettePath, "utf8"));
++      index = buildIndex(cassette);
++    } catch (e) {
++      reject(new Error(`invalid cassette: ${(e as Error).message}`));
++      return;
++    }
+ 
+     const framer = new LineFramer((f) => {
+       if (!f.msg) return;
+@@ -128,10 +147,34 @@ export function runReplayServer(cassettePath: string): Promise<number> {
+       process.stdout.write(JSON.stringify(envelope) + "\n");
+     }, "c2s");
+ 
+-    process.stdin.on("data", (chunk: Buffer) => framer.push(chunk));
++    // Guard the framer the way runProxy does: a synchronous throw from push()
++    // (e.g. an over-long line) must not crash the replay server mid-protocol.
++    process.stdin.on("data", (chunk: Buffer) => {
++      try {
++        framer.push(chunk);
++      } catch {
++        /* observation/parse failure: drop, never crash the wire */
++      }
++    });
+     process.stdin.on("end", () => resolve(0));
+     for (const sig of ["SIGINT", "SIGTERM"] as const) {
+       process.on(sig, () => resolve(0));
+     }
+   });
+ }
++
++/** Parse + shape-validate untrusted cassette JSON. Throws a clear error on bad input. */
++export function parseCassette(text: string): Cassette {
++  const parsed = JSON.parse(text) as unknown;
++  if (!parsed || typeof parsed !== "object") throw new Error("not a JSON object");
++  const c = parsed as Partial<Cassette>;
++  if (!Array.isArray(c.interactions)) throw new Error("missing 'interactions' array");
++  for (const it of c.interactions as unknown[]) {
++    if (!it || typeof it !== "object") throw new Error("interaction is not an object");
++    const req = (it as Partial<Interaction>).request;
++    if (!req || typeof req !== "object" || typeof (req as { method?: unknown }).method !== "string") {
++      throw new Error("interaction.request.method must be a string");
++    }
++  }
++  return parsed as Cassette;
++}
+diff --git a/src/http-proxy.ts b/src/http-proxy.ts
+index c61f52d..005de88 100644
+--- a/src/http-proxy.ts
++++ b/src/http-proxy.ts
+@@ -10,6 +10,13 @@ export interface Route {
+   prefix: string;
+   /** Full upstream MCP endpoint, e.g. http://localhost:3001/mcp */
+   upstream: string;
++  /**
++   * Forward client credential headers (authorization, cookie) to THIS upstream.
++   * Off by default so a credential the client attaches to one route never leaks
++   * to a different operator-fronted upstream; opt in per-route when the client
++   * genuinely authenticates to this upstream.
++   */
++  forwardCredentials?: boolean;
+ }
+ 
+ export interface HttpWrapOptions {
+@@ -54,6 +61,7 @@ export interface RouteMatch {
+   upstream: string;
+   remainder: string;
+   prefix: string;
++  forwardCredentials: boolean;
+ }
+ 
+ /** Longest-prefix-wins routing. Returns the matched upstream + path remainder. */
+@@ -63,7 +71,7 @@ export function resolveRoute(routes: Route[], pathname: string): RouteMatch | nu
+     const remainder = matchRemainder(r.prefix, pathname);
+     if (remainder === null) continue;
+     if (!best || r.prefix.length > best.prefix.length) {
+-      best = { upstream: r.upstream, remainder, prefix: r.prefix };
++      best = { upstream: r.upstream, remainder, prefix: r.prefix, forwardCredentials: Boolean(r.forwardCredentials) };
+     }
+   }
+   return best;
+@@ -78,13 +86,26 @@ export function buildTarget(upstream: string, remainder: string, search: string)
+ }
+ 
+ /** Build a single catch-ish route from a bare --upstream URL: mount at its path. */
+-export function routeFromUpstream(upstream: string): Route {
++export function routeFromUpstream(upstream: string, forwardCredentials = true): Route {
+   const p = new URL(upstream).pathname;
+-  return { prefix: p && p !== "" ? p : "/", upstream };
++  return { prefix: p && p !== "" ? p : "/", upstream, forwardCredentials };
++}
++
++export interface BuildRoutesOptions {
++  /** Forward authorization/cookie to every route (back-compat / single-trusted-upstream). */
++  forwardCredentials?: boolean;
++  /** Per-prefix opt-in to forward credentials (scoped to the upstream the operator trusts). */
++  credsPrefixes?: string[];
+ }
+ 
+ /** Assemble routes from CLI inputs. `--route prefix=url` (repeatable) + --upstream. */
+-export function buildRoutes(upstream: string | undefined, routeSpecs: string[]): Route[] {
++export function buildRoutes(
++  upstream: string | undefined,
++  routeSpecs: string[],
++  opts: BuildRoutesOptions = {},
++): Route[] {
++  const credsPrefixes = new Set(opts.credsPrefixes ?? []);
++
+   const routes: Route[] = [];
+   for (const spec of routeSpecs) {
+     const eq = spec.indexOf("=");
+@@ -93,13 +114,26 @@ export function buildRoutes(upstream: string | undefined, routeSpecs: string[]):
+     const url = spec.slice(eq + 1);
+     if (!prefix.startsWith("/")) throw new Error(`route prefix must start with "/": "${prefix}"`);
+     new URL(url); // validate
+-    routes.push({ prefix, upstream: url });
++    routes.push({ prefix, upstream: url, forwardCredentials: false });
+   }
+   if (upstream) {
+     new URL(upstream); // validate
+-    routes.push(routeFromUpstream(upstream));
++    routes.push(routeFromUpstream(upstream, true));
+   }
+   if (routes.length === 0) throw new Error("no upstream configured (use --upstream or --route)");
++
++  // Credential scoping only matters once a request's path can resolve to a
++  // DIFFERENT upstream than the client meant to authenticate to. With a single
++  // route there is no such boundary, so credentials flow as before. With several
++  // routes, each forwards client/upstream credentials only if explicitly opted in
++  // (--forward-credentials for all, or --creds-route <prefix> per route).
++  if (routes.length === 1) {
++    routes[0].forwardCredentials = true;
++  } else {
++    for (const r of routes) {
++      r.forwardCredentials = Boolean(opts.forwardCredentials) || credsPrefixes.has(r.prefix);
++    }
++  }
+   return routes;
+ }
+ 
+@@ -112,11 +146,18 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
+   });
+ }
+ 
+-function forwardHeaders(req: IncomingMessage): Headers {
++// Always stripped: hop-by-hop headers that must not be replayed upstream.
++const HOP_BY_HOP = ["host", "connection", "content-length", "accept-encoding"];
++// Credential headers: only forwarded when the matched route opts in, so they
++// never land on a different upstream than the client meant to authenticate to.
++const CREDENTIAL_HEADERS = ["authorization", "cookie"];
++
++function forwardHeaders(req: IncomingMessage, forwardCredentials: boolean): Headers {
+   const h = new Headers();
+   for (const [k, v] of Object.entries(req.headers)) {
+     const lk = k.toLowerCase();
+-    if (["host", "connection", "content-length", "accept-encoding"].includes(lk)) continue;
++    if (HOP_BY_HOP.includes(lk)) continue;
++    if (!forwardCredentials && CREDENTIAL_HEADERS.includes(lk)) continue;
+     if (typeof v === "string") h.set(k, v);
+     else if (Array.isArray(v)) h.set(k, v.join(", "));
+   }
+@@ -194,7 +235,7 @@ export function runHttpProxy(opts: HttpWrapOptions): Promise<HttpProxyHandle> {
+ 
+     const upstream = await fetch(target, {
+       method,
+-      headers: forwardHeaders(req),
++      headers: forwardHeaders(req, match.forwardCredentials),
+       body: body && body.length ? body : undefined,
+       redirect: "manual",
+     });
+@@ -208,6 +249,10 @@ export function runHttpProxy(opts: HttpWrapOptions): Promise<HttpProxyHandle> {
+     const headers: Record<string, string> = {};
+     upstream.headers.forEach((v, k) => {
+       if (["transfer-encoding", "content-encoding", "connection", "content-length"].includes(k)) return;
++      // Symmetric to forwardHeaders: don't hand an upstream's session credentials
++      // (Set-Cookie / Mcp-Session-Id) back to a client that didn't opt into
++      // authenticating to THIS upstream, so they can't be reused against another.
++      if (!match.forwardCredentials && ["set-cookie", "mcp-session-id"].includes(k)) return;
+       headers[k] = v;
+     });
+ 
+diff --git a/src/index.ts b/src/index.ts
+index 25fbfb2..dbc16fc 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -49,19 +49,34 @@ function timestamp(): string {
+   return new Date().toISOString().replace(/[:.]/g, "-");
+ }
+ 
++/** One-shot interactive [y/N] prompt on stderr; resolves true only on an explicit yes. */
++function promptYesNo(question: string): Promise<boolean> {
++  return new Promise((resolve) => {
++    process.stderr.write(question);
++    const onData = (chunk: Buffer): void => {
++      process.stdin.pause();
++      process.stdin.off("data", onData);
++      resolve(/^y(es)?$/i.test(chunk.toString("utf8").trim()));
++    };
++    process.stdin.resume();
++    process.stdin.once("data", onData);
++  });
++}
++
+ const HELP = `mcpgaze v${VERSION} — a transparent wiretap for MCP servers
+ 
+ USAGE
+-  mcpgaze wrap [--log <path>] [--print] [--tui] [--native] -- <server command...>
++  mcpgaze wrap [--log <path>] [--print] [--redact] [--tui] [--native] -- <server command...>
+   mcpgaze wrap-http (--upstream <url> | --route <prefix>=<url> ...) [--port <n>] [--host 127.0.0.1]
+-  mcpgaze record [--cassette mcpgaze.cassette.json] [--log <path>] -- <server command...>
++                    [--forward-credentials | --creds-route <prefix> ...] [--redact]
++  mcpgaze record [--cassette mcpgaze.cassette.json] [--log <path>] [--no-redact] -- <server command...>
+   mcpgaze replay --cassette <file>
+   mcpgaze snapshot [--out mcpgaze.baseline.json] -- <server command...>
+   mcpgaze diff [--baseline <f>] [--fail-on <breaking|warning|any>] [--update] -- <server command...>
+   mcpgaze conform [--spec <ver>|--all] [--json] -- <server command...>
+-  mcpgaze verify --cassette <file> [--fail-on <sev>] [--update] -- <server command...>
++  mcpgaze verify --cassette <file> [--fail-on <sev>] [--update] [--allow-tool-calls] -- <server command...>
+   mcpgaze health [--interval <sec>] [--once] [--status <path>] -- <server command...>
+-  mcpgaze triage [--log <session.jsonl>] [--ai] [--model <name>]
++  mcpgaze triage [--log <session.jsonl>] [--ai] [--yes] [--model <name>]
+   mcpgaze preflight [--config <file> [--server <name>]] [-- <server command...>]
+ 
+ COMMANDS
+@@ -71,13 +86,18 @@ COMMANDS
+   wrap-http   Same idea for Streamable HTTP: localhost-bound, Origin-checked.
+               Routes by path prefix, so one proxy can front several upstreams
+               (--route /a=URL --route /b=URL); --upstream is the single-route form.
++              Client Authorization/Cookie are NOT forwarded to an upstream unless
++              you opt in (--creds-route /a, or --forward-credentials for all).
+   record      Wrap a server and write a replayable cassette of req/res pairs.
++              Secrets are redacted by default (it is a shareable artifact);
++              pass --no-redact to capture params/results/stderr verbatim.
+   replay      Deterministic mock MCP server (stdio) from a cassette.
+   snapshot    Probe the server, write a tool-schema baseline you commit to git.
+   diff        Diff the live tool surface vs the baseline. --update accepts it.
+   conform     Spec-conformance suite across protocol versions.
+   verify      Re-issue recorded requests and diff RESPONSE SHAPES. --update
+               re-baselines the cassette (accept intentional behavioral changes).
++              Only read-only methods are re-issued unless --allow-tool-calls.
+   health      Continuously health-check a server (uptime, latency, drift), or
+               --once as a cron/CI liveness probe (exit 0 up / 1 down).
+   triage      Read a session log, surface failures, and (with --ai) get a
+@@ -132,6 +152,7 @@ async function cmdWrap(args: string[]): Promise<void> {
+     jsonlPath: logPath,
+     pretty: !tui && hasFlag(opts, "--print"),
+     onEvent: tui ? (ev) => tui.update(ev) : undefined,
++    redact: hasFlag(opts, "--redact"),
+   });
+ 
+   if (tui) {
+@@ -160,7 +181,10 @@ async function cmdWrapHttp(args: string[]): Promise<void> {
+   }
+   let routes;
+   try {
+-    routes = buildRoutes(upstream, routeSpecs);
++    routes = buildRoutes(upstream, routeSpecs, {
++      forwardCredentials: hasFlag(opts, "--forward-credentials"),
++      credsPrefixes: getOpts(opts, "--creds-route"),
++    });
+   } catch (e) {
+     die((e as Error).message);
+   }
+@@ -168,7 +192,7 @@ async function cmdWrapHttp(args: string[]): Promise<void> {
+   const port = Number(getOpt(opts, "--port") ?? "0");
+   const logPath = getOpt(opts, "--log") ?? `.mcpgaze/session-${timestamp()}.jsonl`;
+   const allow = getOpt(opts, "--allow-origin");
+-  const logger = new Logger({ jsonlPath: logPath, pretty: hasFlag(opts, "--print") });
++  const logger = new Logger({ jsonlPath: logPath, pretty: hasFlag(opts, "--print"), redact: hasFlag(opts, "--redact") });
+   const handle = await runHttpProxy({
+     routes,
+     host,
+@@ -194,9 +218,18 @@ async function cmdRecord(args: string[]): Promise<void> {
+   if (cmd.length === 0) die("usage: mcpgaze record [--cassette <path>] -- <server command...>");
+   const cassettePath = getOpt(opts, "--cassette") ?? "mcpgaze.cassette.json";
+   const logPath = getOpt(opts, "--log") ?? `.mcpgaze/session-${timestamp()}.jsonl`;
+-  const logger = new Logger({ jsonlPath: logPath, pretty: hasFlag(opts, "--print") });
+-  const recorder = new CassetteRecorder();
++  // A cassette is a shareable/committable artifact, so `record` redacts secrets
++  // by default (unlike wrap/wrap-http, where redaction is opt-in to preserve the
++  // exact-bytes debug view). --no-redact restores verbatim capture.
++  const redact = !hasFlag(opts, "--no-redact");
++  const logger = new Logger({ jsonlPath: logPath, pretty: hasFlag(opts, "--print"), redact });
++  const recorder = new CassetteRecorder(redact);
+   process.stderr.write(color.dim(`[mcpgaze] recording cassette to ${cassettePath}\n`));
++  process.stderr.write(
++    redact
++      ? color.dim("[mcpgaze] secret redaction ON (cassette + log); pass --no-redact to capture verbatim\n")
++      : color.yellow("[mcpgaze] --no-redact: secrets in params/results/stderr will be stored verbatim\n"),
++  );
+   const code = await runProxy({
+     command: cmd[0],
+     args: cmd.slice(1),
+@@ -363,17 +396,27 @@ async function cmdConform(args: string[]): Promise<void> {
+ async function cmdVerify(args: string[]): Promise<void> {
+   const { opts, cmd } = splitOnDoubleDash(args);
+   const cassette = getOpt(opts, "--cassette");
+-  if (!cassette || cmd.length === 0) die("usage: mcpgaze verify --cassette <file> [--update] -- <server command...>");
++  if (!cassette || cmd.length === 0) die("usage: mcpgaze verify --cassette <file> [--update] [--allow-tool-calls] -- <server command...>");
++
++  // The cassette's methods are untrusted and re-issued verbatim to the live
++  // server. Re-issue only read-only methods unless the operator opts in.
++  const allowToolCalls = hasFlag(opts, "--allow-tool-calls");
+ 
+   if (hasFlag(opts, "--update")) {
+-    const n = await updateCassette(cmd[0], cmd.slice(1), cassette);
++    const n = await updateCassette(cmd[0], cmd.slice(1), cassette, undefined, { allowToolCalls });
+     process.stdout.write(color.green(`✓ cassette re-baselined`) + ` — ${n} response(s) accepted into ${cassette}\n`);
+     return;
+   }
+ 
+   const failOn = getOpt(opts, "--fail-on");
+-  const r = await verify(cmd[0], cmd.slice(1), cassette);
++  const r = await verify(cmd[0], cmd.slice(1), cassette, undefined, { allowToolCalls });
+   process.stdout.write(color.dim(`re-issued ${r.checked} recorded request(s)\n`));
++  if (r.skipped.length > 0) {
++    const uniq = [...new Set(r.skipped)];
++    process.stdout.write(
++      color.dim(`skipped ${r.skipped.length} state-changing request(s) [${uniq.join(", ")}] — pass --allow-tool-calls to re-issue\n`),
++    );
++  }
+   for (const e of r.errors) process.stdout.write(`  ${color.red("ERROR   ")}  ${color.bold(e.method)} — ${e.message}\n`);
+ 
+   if (r.changes.length === 0 && r.errors.length === 0) {
+@@ -432,11 +475,23 @@ async function cmdHealth(args: string[]): Promise<void> {
+ async function cmdTriage(args: string[]): Promise<void> {
+   const { opts } = splitOnDoubleDash(args);
+   const logPath = getOpt(opts, "--log");
+-  if (!logPath) die("usage: mcpgaze triage --log <session.jsonl> [--ai] [--model <name>]");
++  if (!logPath) die("usage: mcpgaze triage --log <session.jsonl> [--ai] [--yes] [--model <name>]");
++  const preConsented = hasFlag(opts, "--yes");
+   const report = await triage(logPath, {
+     useAi: hasFlag(opts, "--ai"),
+     apiKey: process.env.ANTHROPIC_API_KEY,
+     model: getOpt(opts, "--model") ?? process.env.MCPGAZE_TRIAGE_MODEL,
++    // --ai egresses (redacted) failure details to api.anthropic.com. Require an
++    // explicit acknowledgement: --yes, or a "y" at the interactive preview.
++    confirmEgress: async (prompt) => {
++      if (preConsented) return true;
++      if (!process.stdin.isTTY) return false; // non-interactive without --yes: don't send
++      process.stderr.write(
++        color.yellow("\n[mcpgaze] triage --ai will POST these (redacted) failure details to api.anthropic.com:\n") +
++          color.dim(prompt.split("\n").map((l) => "  " + l).join("\n") + "\n"),
++      );
++      return await promptYesNo("Send to Anthropic? [y/N] ");
++    },
+   });
+ 
+   if (report.failures.length === 0) {
+diff --git a/src/logger.ts b/src/logger.ts
+index 98924f2..82674d9 100644
+--- a/src/logger.ts
++++ b/src/logger.ts
+@@ -3,6 +3,7 @@ import { dirname } from "node:path";
+ import { classify, type MessageKind } from "./jsonrpc";
+ import type { FramedMessage } from "./framer";
+ import { color } from "./colors";
++import { redactRawJson, redactText } from "./redact";
+ 
+ export interface LoggerOptions {
+   /** Structured machine-readable sink (one JSON object per line). */
+@@ -13,6 +14,11 @@ export interface LoggerOptions {
+   prettyStream?: NodeJS.WritableStream;
+   /** Observe every event (used to drive the live TUI). */
+   onEvent?: (ev: Record<string, unknown>) => void;
++  /**
++   * Opt-in: mask credential-shaped params and stderr secrets before they are
++   * written to the JSONL at rest. Never affects the forwarded wire (invariant A).
++   */
++  redact?: boolean;
+ }
+ 
+ type Event = Record<string, unknown> & { t: string; type: string };
+@@ -27,14 +33,18 @@ export class Logger {
+   private readonly pretty: boolean;
+   private readonly out: NodeJS.WritableStream;
+   private readonly onEvent?: (ev: Record<string, unknown>) => void;
++  private readonly redact: boolean;
+ 
+   constructor(opts: LoggerOptions) {
+     this.pretty = Boolean(opts.pretty);
+     this.out = opts.prettyStream ?? process.stderr;
+     this.onEvent = opts.onEvent;
++    this.redact = Boolean(opts.redact);
+     if (opts.jsonlPath) {
+       mkdirSync(dirname(opts.jsonlPath), { recursive: true });
+-      this.file = createWriteStream(opts.jsonlPath, { flags: "a" });
++      // 0600: the session log can carry params/stderr verbatim, so it must not
++      // be group/world-readable (umask 0022 would otherwise leave it 0644).
++      this.file = createWriteStream(opts.jsonlPath, { flags: "a", mode: 0o600 });
+       this.file.on("error", () => {});
+     }
+   }
+@@ -55,14 +65,17 @@ export class Logger {
+       method: f.msg?.method ?? null,
+       latencyMs: latencyMs ?? null,
+       parseError: f.parseError ?? null,
+-      raw: f.raw,
++      // redact masks credential-shaped params at rest; the wire already carried
++      // f.raw byte-exact, so this only touches the on-disk observation.
++      raw: this.redact ? redactRawJson(f.raw) : f.raw,
+     };
+     this.write(ev);
+     if (this.pretty) this.renderMessage(ev, kind);
+   }
+ 
+   serverStderr(text: string): void {
+-    this.write({ t: new Date().toISOString(), type: "server_stderr", text });
++    const t = this.redact ? redactText(text) : text;
++    this.write({ t: new Date().toISOString(), type: "server_stderr", text: t });
+     // Not re-rendered: the proxy already mirrors raw server stderr through.
+   }
+ 
+diff --git a/src/test/conform-verify.test.ts b/src/test/conform-verify.test.ts
+index b062227..5ba6483 100644
+--- a/src/test/conform-verify.test.ts
++++ b/src/test/conform-verify.test.ts
+@@ -48,7 +48,8 @@ test("verify: matching server reports no behavioral drift", async () => {
+   const p = join(tmpdir(), `cass-${Date.now()}-a.json`);
+   writeCassette(p);
+   try {
+-    const r = await verify("node", [TOOL], p, 4000);
++    // tools/call is state-changing, so re-issuing it requires the opt-in.
++    const r = await verify("node", [TOOL], p, 4000, { allowToolCalls: true });
+     assert.equal(r.checked, 1); // initialize is skipped
+     assert.equal(r.changes.length, 0, JSON.stringify(r.changes));
+   } finally {
+@@ -62,7 +63,7 @@ test("verify: drift detected when MOCK_DRIFT=1", async () => {
+   const prev = process.env.MOCK_DRIFT;
+   process.env.MOCK_DRIFT = "1";
+   try {
+-    const r = await verify("node", [TOOL], p, 4000);
++    const r = await verify("node", [TOOL], p, 4000, { allowToolCalls: true });
+     assert.equal(r.checked, 1);
+     assert.ok(r.changes.some((c) => c.severity === "breaking" && /field removed/.test(c.message)), "total removed -> breaking");
+     assert.ok(r.changes.some((c) => c.severity === "warning" && /now empty/.test(c.message)), "results emptied -> warning");
+diff --git a/src/test/http-proxy.test.ts b/src/test/http-proxy.test.ts
+index 7adb9c4..e5b5405 100644
+--- a/src/test/http-proxy.test.ts
++++ b/src/test/http-proxy.test.ts
+@@ -33,8 +33,8 @@ test("buildTarget: appends remainder and preserves query", () => {
+ });
+ 
+ test("buildRoutes: --upstream becomes a route at its own path; bad --route throws", () => {
+-  assert.deepEqual(routeFromUpstream("http://h:3/mcp"), { prefix: "/mcp", upstream: "http://h:3/mcp" });
+-  assert.deepEqual(routeFromUpstream("http://h:3"), { prefix: "/", upstream: "http://h:3" });
++  assert.deepEqual(routeFromUpstream("http://h:3/mcp"), { prefix: "/mcp", upstream: "http://h:3/mcp", forwardCredentials: true });
++  assert.deepEqual(routeFromUpstream("http://h:3"), { prefix: "/", upstream: "http://h:3", forwardCredentials: true });
+   const rs = buildRoutes("http://h:3/mcp", ["/gh=http://h:4/mcp"]);
+   assert.equal(rs.length, 2);
+   assert.throws(() => buildRoutes(undefined, ["no-equals"]), /bad --route/);
+diff --git a/src/triage.ts b/src/triage.ts
+index 06f3a6d..de89cd9 100644
+--- a/src/triage.ts
++++ b/src/triage.ts
+@@ -1,4 +1,5 @@
+ import { readFileSync } from "node:fs";
++import { redactText } from "./redact";
+ 
+ export interface SessionEvent {
+   type: string;
+@@ -62,7 +63,12 @@ export function parseSessionLog(path: string): SessionEvent[] {
+ }
+ 
+ export function buildTriagePrompt(failures: Failure[]): string {
+-  const lines = failures.map((f, i) => `${i + 1}. [${f.kind}] ${f.summary}${f.detail ? `\n   ${f.detail}` : ""}`);
++  // Egress boundary: this prompt is POSTed to an external API. Mask secret-shaped
++  // tokens (API keys, DSN passwords, bearer/JWT) in failure details — which carry
++  // verbatim server stderr and JSON-RPC error bodies — before they leave the host.
++  const lines = failures.map(
++    (f, i) => `${i + 1}. [${f.kind}] ${f.summary}${f.detail ? `\n   ${redactText(f.detail)}` : ""}`,
++  );
+   return [
+     "You are debugging a Model Context Protocol (MCP) server. Below are failure",
+     "signals captured by a transparent proxy during a live session. For each",
+@@ -109,6 +115,13 @@ export interface TriageOptions {
+   apiKey?: string;
+   model?: string;
+   useAi?: boolean;
++  /**
++   * Consent gate for egress. `--ai` ships failure details (redacted, but still
++   * derived from your session) to api.anthropic.com; the CLI must obtain an
++   * explicit acknowledgement, optionally previewing the exact prompt bytes.
++   * Return false to abort the send. Omitted ⇒ treated as not consented.
++   */
++  confirmEgress?: (prompt: string) => boolean | Promise<boolean>;
+ }
+ 
+ export async function triage(logPath: string, opts: TriageOptions = {}): Promise<TriageReport> {
+@@ -124,8 +137,15 @@ export async function triage(logPath: string, opts: TriageOptions = {}): Promise
+     report.aiSkippedReason = "no ANTHROPIC_API_KEY set";
+     return report;
+   }
++  const prompt = buildTriagePrompt(failures);
++  // Explicit content consent before the redacted prompt egresses to Anthropic.
++  const consented = opts.confirmEgress ? await opts.confirmEgress(prompt) : false;
++  if (!consented) {
++    report.aiSkippedReason = "egress to api.anthropic.com not confirmed (pass --yes to consent)";
++    return report;
++  }
+   try {
+-    report.aiDiagnosis = await callClaude(buildTriagePrompt(failures), opts.apiKey, opts.model);
++    report.aiDiagnosis = await callClaude(prompt, opts.apiKey, opts.model);
+   } catch (e) {
+     report.aiSkippedReason = (e as Error).message;
+   }
+diff --git a/src/verify.ts b/src/verify.ts
+index cd8b53e..6b4ac28 100644
+--- a/src/verify.ts
++++ b/src/verify.ts
+@@ -4,19 +4,52 @@ import { shapeOf, diffShape } from "./shape";
+ import type { Change } from "./schema-diff";
+ import { PROTOCOL_VERSION } from "./client";
+ import { VERSION } from "./version";
+-import type { Cassette, Interaction } from "./cassette";
++import { parseCassette, type Interaction } from "./cassette";
+ 
+ export interface VerifyResult {
+   checked: number;
+   changes: Array<Change & { method: string }>;
+   errors: Array<{ method: string; message: string }>;
++  /** Verifiable state-changing methods skipped because re-issuing them wasn't opted into. */
++  skipped: string[];
+ }
+ 
+-/** Methods we don't re-issue: handshake + fire-and-forget notifications. */
++export interface VerifyOptions {
++  timeoutMs?: number;
++  /**
++   * The cassette is untrusted JSON: its method/params are re-issued verbatim to
++   * the live server. By default we re-issue only read-only methods; opt in to
++   * also re-issue state-changing calls (tools/call, etc).
++   */
++  allowToolCalls?: boolean;
++}
++
++/** Read-only MCP methods that are safe to re-issue from an untrusted cassette. */
++const READ_ONLY_METHODS = new Set([
++  "tools/list",
++  "resources/list",
++  "resources/templates/list",
++  "prompts/list",
++  "ping",
++  "completion/complete",
++]);
++
++/** Methods we never re-issue: handshake + fire-and-forget notifications. */
+ function isVerifiable(method: string): boolean {
+   return method !== "initialize" && !method.startsWith("notifications/");
+ }
+ 
++/**
++ * Whether to re-issue this recorded method against the live server. State-
++ * changing methods (anything outside the read-only allow-list) are skipped
++ * unless the operator opts in — a hostile cassette must not be able to drive
++ * arbitrary tools/call or resources/read at the live server through verify.
++ */
++function shouldReissue(method: string, allowToolCalls: boolean): boolean {
++  if (!isVerifiable(method)) return false;
++  return allowToolCalls || READ_ONLY_METHODS.has(method);
++}
++
+ /**
+  * Re-issue each recorded request against the LIVE server and compare the SHAPE
+  * of the response to the recorded one. Catches drift that `diff` (declared
+@@ -30,10 +63,12 @@ export async function verify(
+   args: string[],
+   cassettePath: string,
+   timeoutMs = 15000,
++  opts: VerifyOptions = {},
+ ): Promise<VerifyResult> {
+-  const cassette = JSON.parse(readFileSync(cassettePath, "utf8")) as Cassette;
++  const allowToolCalls = Boolean(opts.allowToolCalls);
++  const cassette = parseCassette(readFileSync(cassettePath, "utf8"));
+   const conn = McpConnection.spawn(command, args);
+-  const result: VerifyResult = { checked: 0, changes: [], errors: [] };
++  const result: VerifyResult = { checked: 0, changes: [], errors: [], skipped: [] };
+ 
+   try {
+     const init = await conn.request(
+@@ -47,6 +82,10 @@ export async function verify(
+     for (const it of cassette.interactions as Interaction[]) {
+       const method = it.request.method;
+       if (!isVerifiable(method)) continue;
++      if (!shouldReissue(method, allowToolCalls)) {
++        result.skipped.push(method); // state-changing + not opted in
++        continue;
++      }
+       result.checked++;
+ 
+       let live;
+@@ -96,8 +135,10 @@ export async function updateCassette(
+   args: string[],
+   cassettePath: string,
+   timeoutMs = 15000,
++  opts: VerifyOptions = {},
+ ): Promise<number> {
+-  const cassette = JSON.parse(readFileSync(cassettePath, "utf8")) as Cassette;
++  const allowToolCalls = Boolean(opts.allowToolCalls);
++  const cassette = parseCassette(readFileSync(cassettePath, "utf8"));
+   const conn = McpConnection.spawn(command, args);
+   let updated = 0;
+   try {
+@@ -110,7 +151,7 @@ export async function updateCassette(
+     conn.notify("notifications/initialized");
+ 
+     for (const it of cassette.interactions as Interaction[]) {
+-      if (!isVerifiable(it.request.method)) continue;
++      if (!shouldReissue(it.request.method, allowToolCalls)) continue;
+       const live = await conn.request(it.request.method, it.request.params, timeoutMs);
+       it.response = live.error ? { error: live.error } : { result: live.result };
+       updated++;
+@@ -127,7 +168,7 @@ export async function updateCassette(
+         `failed to serialize updated cassette (a live response is too deeply nested): ${(e as Error).message}`,
+       );
+     }
+-    writeFileSync(cassettePath, serialized);
++    writeFileSync(cassettePath, serialized, { mode: 0o600 }); // see CassetteRecorder.write
+     return updated;
+   } finally {
+     conn.close();

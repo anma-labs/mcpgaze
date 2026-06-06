@@ -10,6 +10,13 @@ export interface Route {
   prefix: string;
   /** Full upstream MCP endpoint, e.g. http://localhost:3001/mcp */
   upstream: string;
+  /**
+   * Forward client credential headers (authorization, cookie) to THIS upstream.
+   * Off by default so a credential the client attaches to one route never leaks
+   * to a different operator-fronted upstream; opt in per-route when the client
+   * genuinely authenticates to this upstream.
+   */
+  forwardCredentials?: boolean;
 }
 
 export interface HttpWrapOptions {
@@ -54,6 +61,7 @@ export interface RouteMatch {
   upstream: string;
   remainder: string;
   prefix: string;
+  forwardCredentials: boolean;
 }
 
 /** Longest-prefix-wins routing. Returns the matched upstream + path remainder. */
@@ -63,7 +71,7 @@ export function resolveRoute(routes: Route[], pathname: string): RouteMatch | nu
     const remainder = matchRemainder(r.prefix, pathname);
     if (remainder === null) continue;
     if (!best || r.prefix.length > best.prefix.length) {
-      best = { upstream: r.upstream, remainder, prefix: r.prefix };
+      best = { upstream: r.upstream, remainder, prefix: r.prefix, forwardCredentials: Boolean(r.forwardCredentials) };
     }
   }
   return best;
@@ -78,13 +86,28 @@ export function buildTarget(upstream: string, remainder: string, search: string)
 }
 
 /** Build a single catch-ish route from a bare --upstream URL: mount at its path. */
-export function routeFromUpstream(upstream: string): Route {
+export function routeFromUpstream(upstream: string, forwardCredentials = true): Route {
   const p = new URL(upstream).pathname;
-  return { prefix: p && p !== "" ? p : "/", upstream };
+  return { prefix: p && p !== "" ? p : "/", upstream, forwardCredentials };
+}
+
+export interface BuildRoutesOptions {
+  /** Forward authorization/cookie to every route (back-compat / single-trusted-upstream). */
+  forwardCredentials?: boolean;
+  /** Per-prefix opt-in to forward credentials (scoped to the upstream the operator trusts). */
+  credsPrefixes?: string[];
+  /** Explicit opt-out: strip authorization/cookie on every route, even the single-route default. */
+  noForwardCredentials?: boolean;
 }
 
 /** Assemble routes from CLI inputs. `--route prefix=url` (repeatable) + --upstream. */
-export function buildRoutes(upstream: string | undefined, routeSpecs: string[]): Route[] {
+export function buildRoutes(
+  upstream: string | undefined,
+  routeSpecs: string[],
+  opts: BuildRoutesOptions = {},
+): Route[] {
+  const credsPrefixes = new Set(opts.credsPrefixes ?? []);
+
   const routes: Route[] = [];
   for (const spec of routeSpecs) {
     const eq = spec.indexOf("=");
@@ -93,13 +116,30 @@ export function buildRoutes(upstream: string | undefined, routeSpecs: string[]):
     const url = spec.slice(eq + 1);
     if (!prefix.startsWith("/")) throw new Error(`route prefix must start with "/": "${prefix}"`);
     new URL(url); // validate
-    routes.push({ prefix, upstream: url });
+    routes.push({ prefix, upstream: url, forwardCredentials: false });
   }
   if (upstream) {
     new URL(upstream); // validate
-    routes.push(routeFromUpstream(upstream));
+    routes.push(routeFromUpstream(upstream, true));
   }
   if (routes.length === 0) throw new Error("no upstream configured (use --upstream or --route)");
+
+  // Credential scoping only matters once a request's path can resolve to a
+  // DIFFERENT upstream than the client meant to authenticate to. With a single
+  // route there is no such boundary, so credentials flow as before. With several
+  // routes, each forwards client/upstream credentials only if explicitly opted in
+  // (--forward-credentials for all, or --creds-route <prefix> per route).
+  // --no-forward-credentials is an explicit opt-out that strips on every route,
+  // including the single-route default.
+  if (opts.noForwardCredentials) {
+    for (const r of routes) r.forwardCredentials = false;
+  } else if (routes.length === 1) {
+    routes[0].forwardCredentials = true;
+  } else {
+    for (const r of routes) {
+      r.forwardCredentials = Boolean(opts.forwardCredentials) || credsPrefixes.has(r.prefix);
+    }
+  }
   return routes;
 }
 
@@ -112,11 +152,18 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
-function forwardHeaders(req: IncomingMessage): Headers {
+// Always stripped: hop-by-hop headers that must not be replayed upstream.
+const HOP_BY_HOP = ["host", "connection", "content-length", "accept-encoding"];
+// Credential headers: only forwarded when the matched route opts in, so they
+// never land on a different upstream than the client meant to authenticate to.
+const CREDENTIAL_HEADERS = ["authorization", "cookie"];
+
+function forwardHeaders(req: IncomingMessage, forwardCredentials: boolean): Headers {
   const h = new Headers();
   for (const [k, v] of Object.entries(req.headers)) {
     const lk = k.toLowerCase();
-    if (["host", "connection", "content-length", "accept-encoding"].includes(lk)) continue;
+    if (HOP_BY_HOP.includes(lk)) continue;
+    if (!forwardCredentials && CREDENTIAL_HEADERS.includes(lk)) continue;
     if (typeof v === "string") h.set(k, v);
     else if (Array.isArray(v)) h.set(k, v.join(", "));
   }
@@ -194,7 +241,7 @@ export function runHttpProxy(opts: HttpWrapOptions): Promise<HttpProxyHandle> {
 
     const upstream = await fetch(target, {
       method,
-      headers: forwardHeaders(req),
+      headers: forwardHeaders(req, match.forwardCredentials),
       body: body && body.length ? body : undefined,
       redirect: "manual",
     });
@@ -208,6 +255,10 @@ export function runHttpProxy(opts: HttpWrapOptions): Promise<HttpProxyHandle> {
     const headers: Record<string, string> = {};
     upstream.headers.forEach((v, k) => {
       if (["transfer-encoding", "content-encoding", "connection", "content-length"].includes(k)) return;
+      // Symmetric to forwardHeaders: don't hand an upstream's session credentials
+      // (Set-Cookie / Mcp-Session-Id) back to a client that didn't opt into
+      // authenticating to THIS upstream, so they can't be reused against another.
+      if (!match.forwardCredentials && ["set-cookie", "mcp-session-id"].includes(k)) return;
       headers[k] = v;
     });
 
