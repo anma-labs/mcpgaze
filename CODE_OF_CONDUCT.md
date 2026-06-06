@@ -1,7 +1,6 @@
 +++
 version = "2.1"
 aliases = ["/version/2/1"]
-reportingPlaceholder = "security@anmalabs.dev"
 +++
 
 # Contributor Covenant Code of Conduct
