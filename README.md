@@ -2,7 +2,7 @@
 
 **A transparent wiretap for MCP servers.** See exactly what your AI client sends your server — without breaking the protocol — and catch tool-schema drift before it ships.
 
-> 52% of MCP servers are dead, and the #1 debugging trap is that **your server's stdout *is* the protocol** — so a single `console.log` corrupts the wire and your logs vanish. `mcpgaze` sits transparently between your client and your server, forwarding every byte untouched while logging everything through a side channel.
+> Roughly half of published MCP servers are abandoned or broken-on-install — a 2025 academic crawl of ~17.6k registry entries ([arXiv:2509.25292](https://arxiv.org/abs/2509.25292)) found more than half invalid or low-value (that's abandonment, not live downtime) — and the #1 debugging trap is that **your server's stdout *is* the protocol** — so a single `console.log` corrupts the wire and your logs vanish. `mcpgaze` sits transparently between your client and your server, forwarding every byte untouched while logging everything through a side channel.
 
 ```
    BEFORE                              AFTER
@@ -21,6 +21,8 @@ npm i -g mcpgaze            # or global
 ```
 
 Zero runtime dependencies — nothing extra enters your protocol path.
+
+> **Heads-up:** `mcpgaze` isn't published to npm yet, so the `npx`/`-g` commands above won't resolve until it is. Until then, build from source — `npm install && npm run build` — and run `node dist/index.js` in place of `npx -y mcpgaze` (including in the `claude_desktop_config.json` examples below).
 
 ## `wrap` — see the live session
 
@@ -101,7 +103,7 @@ mcpgaze wrap-http --port 7000 \
 
 `--upstream URL` is the single-route shorthand (it mounts at the URL's own path). The remainder of the request path after the matched prefix is appended to the upstream (nginx-style), and the client's query string is preserved. Unmatched paths get a clear 404, and each route taken is recorded in the session log.
 
-Security defaults, baked in: binds to `127.0.0.1` only, and rejects cross-origin browser requests (DNS-rebinding defense — the class of bug behind the Inspector's CVE-2025-49596). `--host` and `--allow-origin` override, with a warning.
+Security defaults, baked in: binds to `127.0.0.1` only, and rejects cross-origin browser requests (DNS-rebinding defense — the class of bug behind the Inspector's CVE-2025-49596). `--host` and `--allow-origin` override these defaults; binding `--host` beyond localhost prints a warning (`--allow-origin` overrides silently).
 
 **Credential scoping.** A single `--upstream`/`--route` forwards the client's `Authorization`/`Cookie` to that one upstream — there's only one destination, so a token can't be misrouted; pass `--no-forward-credentials` to strip them anyway. With **multiple** `--route`s a path could resolve to a different upstream than the client meant to authenticate to, so credentials — and `Set-Cookie`/`Mcp-Session-Id` on the way back — are **stripped unless that route opts in**: `--creds-route /github` per route, or `--forward-credentials` for all.
 
@@ -110,14 +112,14 @@ Security defaults, baked in: binds to `127.0.0.1` only, and rejects cross-origin
 Record a real session into a cassette, then replay it as a deterministic mock server with no backend — for offline client development and regression CI.
 
 ```bash
-mcpgaze record --cassette s.json -- node server.js   # wrap + capture req/res pairs
-mcpgaze record --cassette s.json --redact -- node ... # mask credential-shaped params/results
+mcpgaze record --cassette s.json -- node server.js      # wrap + capture req/res pairs (secrets redacted by default)
+mcpgaze record --cassette s.json --no-redact -- node ... # capture params/results/stderr verbatim
 mcpgaze replay --cassette s.json                      # serve those pairs over stdio
 ```
 
 Replay matches requests by method + params (exact first, then a unique method-only fallback) and returns a clear JSON-RPC error for anything unrecorded instead of hanging. Verified: replayed responses are byte-identical to the originals.
 
-A cassette stores request params and response results **verbatim**, so it can contain secrets (tokens, passwords, DSNs) the session carried. Cassettes are written `0600` and `*.cassette.json` is git-ignored by default — record with `--redact` and review a cassette before committing or sharing it. `verify` re-issues a cassette's methods against a live server; only read-only methods are re-issued unless you pass `--allow-tool-calls`.
+A cassette stores request params and response results **verbatim**, so it can contain secrets (tokens, passwords, DSNs) the session carried. Cassettes are written `0600` and `*.cassette.json` is git-ignored by default — recording redacts credential-shaped values by default (pass `--no-redact` to capture verbatim); review a cassette before committing or sharing it. `verify` re-issues a cassette's methods against a live server; only read-only methods are re-issued unless you pass `--allow-tool-calls`.
 
 ## `preflight` — catch the env vars a GUI client won't inherit
 
@@ -150,7 +152,7 @@ Checks include: initialize returns a valid result with `protocolVersion` and `se
 
 ```bash
 mcpgaze record --cassette s.json -- node server.js   # capture real behavior once
-mcpgaze verify --cassette s.json --fail-on warning -- node server.js
+mcpgaze verify --cassette s.json --fail-on warning --allow-tool-calls -- node server.js
 #   WARNING   tools/call.results[] — array is now empty (was populated)
 #   BREAKING  tools/call.total — field removed from response
 ```
@@ -162,7 +164,7 @@ Severity: field removed / type change = **breaking**; non-empty array now empty 
 Read a session log (from `wrap`/`wrap-http`), surface every failure signal — error responses, orphaned requests, parse errors, and crash-y server stderr — and, with `--ai`, get a plain-English root cause and fix from Claude.
 
 ```bash
-mcpgaze triage --log .mcpgaze/session-*.jsonl          # local failure summary
+mcpgaze triage --log .mcpgaze/session-<ts>.jsonl       # local failure summary (one log file; --log reads a single path)
 ANTHROPIC_API_KEY=sk-... mcpgaze triage --log s.jsonl --ai
 ```
 
@@ -187,13 +189,13 @@ mcpgaze wrap --native -- node server.js     # or set MCPGAZE_PROXY_BIN
 |---|---|---|
 | direct (no proxy) | ~124k req/s | — |
 | Node proxy | ~47k req/s | 1.0× |
-| Rust proxy | ~78k req/s | **~1.6×** |
+| Rust proxy | ~78k req/s | **~1.7×** |
 
-Rust is genuinely ~64% faster and roughly halves added latency — but even the Node proxy at 47k req/s far exceeds any real MCP workload. So `--native` earns its place mainly for **single-binary distribution (no Node)** and high-throughput/streaming cases, not because Node was too slow. It stays opt-in. (The Rust path does forward + capture with best-effort classification; full id-correlation and the rest of the command surface live in the Node CLI, which reads the same JSONL.)
+Rust is genuinely ~66% faster (78k vs 47k req/s) and roughly halves added latency — but even the Node proxy at 47k req/s far exceeds any real MCP workload. (Absolute throughput is machine- and runtime-specific and the bench harness isn't committed yet, so treat the headline numbers as one machine's reading — the durable result is the *relationship*: direct ≫ Rust > Node, all far above any real workload.) So `--native` earns its place mainly for **single-binary distribution (no Node)** and high-throughput/streaming cases, not because Node was too slow. It stays opt-in. (The Rust path does forward + capture with best-effort classification; full id-correlation and the rest of the command surface live in the Node CLI, which reads the same JSONL.)
 
 ## `health` — continuous local monitoring
 
-Know the moment your server joins the 52% dead. `health` probes a server on an interval (initialize + tools/list), tracks uptime / latency / tool-schema drift, prints up↔down and drift transitions, and persists status to `.mcpgaze/health.json`.
+Know the moment your server goes down. `health` probes a server on an interval (initialize + tools/list), tracks uptime / latency / tool-schema drift, prints up↔down and drift transitions, and persists status to `.mcpgaze/health.json`.
 
 ```bash
 mcpgaze health --interval 30 -- node server.js     # daemon
@@ -230,11 +232,11 @@ Because mcpgaze sits in the protocol data path, correctness is enforced by *gene
 
 ## Where this is going (open core)
 
-The CLI — proxy, local logging, schema snapshot/diff, CI gating — is free and open source (Apache-2.0), forever. A future hosted layer will handle what a local CLI can't: **continuous** uptime/health monitoring across many servers (know the moment one of yours joins the 52%), drift *history*, alerting, and team workspaces. The line is simple: one dev, one server, one machine is free; aggregation across servers, time, and teams is the paid layer.
+The CLI — proxy, local logging, schema snapshot/diff, CI gating — is free and open source (Apache-2.0), forever. A future hosted layer will handle what a local CLI can't: **continuous** uptime/health monitoring across many servers (know the moment one of yours goes down), drift *history*, alerting, and team workspaces. The line is simple: one dev, one server, one machine is free; aggregation across servers, time, and teams is the paid layer.
 
 ## Scope & honesty
 
-The schema differ is deliberately focused on the cases that break agents (properties, required, type, enum) — it is not a general JSON Schema differ. The current MCP spec target is `2025-06-18`; conformance across versions is on the roadmap.
+The schema differ is deliberately focused on the cases that break agents (properties, required, type, enum) — it is not a general JSON Schema differ. The current stable MCP spec is `2025-11-25` (with `2026-07-28` in release-candidate); mcpgaze probes with `2025-06-18` by default and can run conformance against all three via `conform --all`.
 
 ## License
 
