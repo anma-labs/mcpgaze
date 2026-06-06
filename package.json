@@ -2,12 +2,23 @@
   "name": "mcpgaze",
   "version": "1.0.0",
   "description": "A transparent wiretap for MCP servers. See exactly what your AI client sends your server — without breaking the protocol — and catch tool-schema drift in CI.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anma-labs/mcpgaze.git"
+  },
+  "homepage": "https://github.com/anma-labs/mcpgaze#readme",
+  "bugs": {
+    "url": "https://github.com/anma-labs/mcpgaze/issues"
+  },
   "type": "module",
   "bin": {
     "mcpgaze": "dist/index.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "native/mcpgaze-proxy/Cargo.toml",
+    "native/mcpgaze-proxy/src",
+    "!native/**/target"
   ],
   "engines": {
     "node": ">=18"
@@ -18,7 +29,8 @@
     "test": "node --import tsx --test src/test/*.test.ts",
     "test:fuzz": "node --import tsx --test src/test/fuzz.test.ts",
     "harden": "npm run build && node scripts/diff-proxies.mjs --corpus scripts/corpus --repeat 10 && node scripts/wire-integrity.mjs && node scripts/dogfood.mjs",
-    "dev": "tsx src/index.ts"
+    "dev": "tsx src/index.ts",
+    "prepack": "npm run build"
   },
   "keywords": [
     "mcp",

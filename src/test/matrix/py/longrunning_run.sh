@@ -1,2 +1,3 @@
 #!/usr/bin/env bash
-exec env PYTHONPATH=/tmp/mcp-pylib python3 /home/gogetassgk/projects/mcpgaze/src/test/matrix/py/longrunning.py
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec env PYTHONPATH=/tmp/mcp-pylib python3 "$DIR/longrunning.py"

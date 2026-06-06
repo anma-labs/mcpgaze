@@ -1,2 +1,3 @@
 #!/usr/bin/env bash
-exec node /home/gogetassgk/projects/mcpgaze/src/test/matrix/ts/longrunning.mjs
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec node "$DIR/longrunning.mjs"
