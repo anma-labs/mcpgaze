@@ -1,7 +1,7 @@
 import { McpConnection } from "./mcp-connection";
 import { VERSION } from "./version";
 
-export const PROTOCOL_VERSION = "2025-06-18";
+export const PROTOCOL_VERSION = "2025-11-25";
 
 /**
  * Default handshake/probe timeout (ms), shared so the probe-driven commands stay
