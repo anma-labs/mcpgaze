@@ -5,3 +5,7 @@ dist/
 .DS_Store
 native/**/target/
 Cargo.lock
+# Cassettes can capture request params / response results verbatim — don't
+# commit them by default (record with --redact, or curate before sharing).
+mcpgaze.cassette.json
+*.cassette.json

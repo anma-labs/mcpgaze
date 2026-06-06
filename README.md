@@ -109,10 +109,13 @@ Record a real session into a cassette, then replay it as a deterministic mock se
 
 ```bash
 mcpgaze record --cassette s.json -- node server.js   # wrap + capture req/res pairs
+mcpgaze record --cassette s.json --redact -- node ... # mask credential-shaped params/results
 mcpgaze replay --cassette s.json                      # serve those pairs over stdio
 ```
 
 Replay matches requests by method + params (exact first, then a unique method-only fallback) and returns a clear JSON-RPC error for anything unrecorded instead of hanging. Verified: replayed responses are byte-identical to the originals.
+
+A cassette stores request params and response results **verbatim**, so it can contain secrets (tokens, passwords, DSNs) the session carried. Cassettes are written `0600` and `*.cassette.json` is git-ignored by default — record with `--redact` and review a cassette before committing or sharing it. `verify` re-issues a cassette's methods against a live server; only read-only methods are re-issued unless you pass `--allow-tool-calls`.
 
 ## `preflight` — catch the env vars a GUI client won't inherit
 

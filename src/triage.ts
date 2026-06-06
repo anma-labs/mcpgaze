@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { redactText } from "./redact";
 
 export interface SessionEvent {
   type: string;
@@ -62,7 +63,12 @@ export function parseSessionLog(path: string): SessionEvent[] {
 }
 
 export function buildTriagePrompt(failures: Failure[]): string {
-  const lines = failures.map((f, i) => `${i + 1}. [${f.kind}] ${f.summary}${f.detail ? `\n   ${f.detail}` : ""}`);
+  // Egress boundary: this prompt is POSTed to an external API. Mask secret-shaped
+  // tokens (API keys, DSN passwords, bearer/JWT) in failure details — which carry
+  // verbatim server stderr and JSON-RPC error bodies — before they leave the host.
+  const lines = failures.map(
+    (f, i) => `${i + 1}. [${f.kind}] ${f.summary}${f.detail ? `\n   ${redactText(f.detail)}` : ""}`,
+  );
   return [
     "You are debugging a Model Context Protocol (MCP) server. Below are failure",
     "signals captured by a transparent proxy during a live session. For each",
@@ -109,6 +115,13 @@ export interface TriageOptions {
   apiKey?: string;
   model?: string;
   useAi?: boolean;
+  /**
+   * Consent gate for egress. `--ai` ships failure details (redacted, but still
+   * derived from your session) to api.anthropic.com; the CLI must obtain an
+   * explicit acknowledgement, optionally previewing the exact prompt bytes.
+   * Return false to abort the send. Omitted ⇒ treated as not consented.
+   */
+  confirmEgress?: (prompt: string) => boolean | Promise<boolean>;
 }
 
 export async function triage(logPath: string, opts: TriageOptions = {}): Promise<TriageReport> {
@@ -124,8 +137,15 @@ export async function triage(logPath: string, opts: TriageOptions = {}): Promise
     report.aiSkippedReason = "no ANTHROPIC_API_KEY set";
     return report;
   }
+  const prompt = buildTriagePrompt(failures);
+  // Explicit content consent before the redacted prompt egresses to Anthropic.
+  const consented = opts.confirmEgress ? await opts.confirmEgress(prompt) : false;
+  if (!consented) {
+    report.aiSkippedReason = "egress to api.anthropic.com not confirmed (pass --yes to consent)";
+    return report;
+  }
   try {
-    report.aiDiagnosis = await callClaude(buildTriagePrompt(failures), opts.apiKey, opts.model);
+    report.aiDiagnosis = await callClaude(prompt, opts.apiKey, opts.model);
   } catch (e) {
     report.aiSkippedReason = (e as Error).message;
   }

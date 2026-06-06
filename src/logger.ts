@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 import { classify, type MessageKind } from "./jsonrpc";
 import type { FramedMessage } from "./framer";
 import { color } from "./colors";
+import { redactRawJson, redactText } from "./redact";
 
 export interface LoggerOptions {
   /** Structured machine-readable sink (one JSON object per line). */
@@ -13,6 +14,11 @@ export interface LoggerOptions {
   prettyStream?: NodeJS.WritableStream;
   /** Observe every event (used to drive the live TUI). */
   onEvent?: (ev: Record<string, unknown>) => void;
+  /**
+   * Opt-in: mask credential-shaped params and stderr secrets before they are
+   * written to the JSONL at rest. Never affects the forwarded wire (invariant A).
+   */
+  redact?: boolean;
 }
 
 type Event = Record<string, unknown> & { t: string; type: string };
@@ -27,14 +33,18 @@ export class Logger {
   private readonly pretty: boolean;
   private readonly out: NodeJS.WritableStream;
   private readonly onEvent?: (ev: Record<string, unknown>) => void;
+  private readonly redact: boolean;
 
   constructor(opts: LoggerOptions) {
     this.pretty = Boolean(opts.pretty);
     this.out = opts.prettyStream ?? process.stderr;
     this.onEvent = opts.onEvent;
+    this.redact = Boolean(opts.redact);
     if (opts.jsonlPath) {
       mkdirSync(dirname(opts.jsonlPath), { recursive: true });
-      this.file = createWriteStream(opts.jsonlPath, { flags: "a" });
+      // 0600: the session log can carry params/stderr verbatim, so it must not
+      // be group/world-readable (umask 0022 would otherwise leave it 0644).
+      this.file = createWriteStream(opts.jsonlPath, { flags: "a", mode: 0o600 });
       this.file.on("error", () => {});
     }
   }
@@ -55,14 +65,17 @@ export class Logger {
       method: f.msg?.method ?? null,
       latencyMs: latencyMs ?? null,
       parseError: f.parseError ?? null,
-      raw: f.raw,
+      // redact masks credential-shaped params at rest; the wire already carried
+      // f.raw byte-exact, so this only touches the on-disk observation.
+      raw: this.redact ? redactRawJson(f.raw) : f.raw,
     };
     this.write(ev);
     if (this.pretty) this.renderMessage(ev, kind);
   }
 
   serverStderr(text: string): void {
-    this.write({ t: new Date().toISOString(), type: "server_stderr", text });
+    const t = this.redact ? redactText(text) : text;
+    this.write({ t: new Date().toISOString(), type: "server_stderr", text: t });
     // Not re-rendered: the proxy already mirrors raw server stderr through.
   }
 

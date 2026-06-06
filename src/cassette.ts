@@ -1,6 +1,7 @@
 import { writeFileSync, readFileSync } from "node:fs";
 import { LineFramer } from "./framer";
 import { VERSION } from "./version";
+import { redactValue } from "./redact";
 import type { PairedRequest, PairedResponse } from "./proxy";
 
 export interface Interaction {
@@ -38,10 +39,16 @@ export class CassetteRecorder {
   private readonly interactions: Interaction[] = [];
   private readonly seen = new Set<string>();
 
+  /** When true, mask credential-shaped params/results before they are persisted. */
+  constructor(private readonly redact = false) {}
+
   add(request: PairedRequest, response: PairedResponse): void {
+    const params = this.redact ? redactValue(request.params) : request.params;
     const interaction: Interaction = {
-      request: { method: request.method, params: request.params },
-      response: response.error ? { error: response.error } : { result: response.result },
+      request: { method: request.method, params },
+      response: response.error
+        ? { error: this.redact ? (redactValue(response.error) as Interaction["response"]["error"]) : response.error }
+        : { result: this.redact ? redactValue(response.result) : response.result },
     };
     const key = stableStringify(interaction);
     if (this.seen.has(key)) return;
@@ -58,7 +65,10 @@ export class CassetteRecorder {
   }
 
   write(path: string): number {
-    writeFileSync(path, JSON.stringify(this.toCassette(), null, 2) + "\n");
+    // 0600: a cassette stores request params and response results verbatim and
+    // its default path is a non-gitignored repo-root file, so it must not be
+    // group/world-readable (umask 0022 would otherwise leave it 0644).
+    writeFileSync(path, JSON.stringify(this.toCassette(), null, 2) + "\n", { mode: 0o600 });
     return this.interactions.length;
   }
 }
@@ -112,9 +122,18 @@ function pickMethodOnly(index: CassetteIndex, method: string): Interaction | und
  * a real session once, replay it forever in CI or for offline client dev.
  */
 export function runReplayServer(cassettePath: string): Promise<number> {
-  return new Promise((resolve) => {
-    const cassette = JSON.parse(readFileSync(cassettePath, "utf8")) as Cassette;
-    const index = buildIndex(cassette);
+  return new Promise((resolve, reject) => {
+    // The cassette is an untrusted file. Parse + shape-validate up front so a
+    // malformed/hostile cassette fails with a clean error instead of an
+    // uncaught throw mid-startup.
+    let index: CassetteIndex;
+    try {
+      const cassette = parseCassette(readFileSync(cassettePath, "utf8"));
+      index = buildIndex(cassette);
+    } catch (e) {
+      reject(new Error(`invalid cassette: ${(e as Error).message}`));
+      return;
+    }
 
     const framer = new LineFramer((f) => {
       if (!f.msg) return;
@@ -128,10 +147,34 @@ export function runReplayServer(cassettePath: string): Promise<number> {
       process.stdout.write(JSON.stringify(envelope) + "\n");
     }, "c2s");
 
-    process.stdin.on("data", (chunk: Buffer) => framer.push(chunk));
+    // Guard the framer the way runProxy does: a synchronous throw from push()
+    // (e.g. an over-long line) must not crash the replay server mid-protocol.
+    process.stdin.on("data", (chunk: Buffer) => {
+      try {
+        framer.push(chunk);
+      } catch {
+        /* observation/parse failure: drop, never crash the wire */
+      }
+    });
     process.stdin.on("end", () => resolve(0));
     for (const sig of ["SIGINT", "SIGTERM"] as const) {
       process.on(sig, () => resolve(0));
     }
   });
+}
+
+/** Parse + shape-validate untrusted cassette JSON. Throws a clear error on bad input. */
+export function parseCassette(text: string): Cassette {
+  const parsed = JSON.parse(text) as unknown;
+  if (!parsed || typeof parsed !== "object") throw new Error("not a JSON object");
+  const c = parsed as Partial<Cassette>;
+  if (!Array.isArray(c.interactions)) throw new Error("missing 'interactions' array");
+  for (const it of c.interactions as unknown[]) {
+    if (!it || typeof it !== "object") throw new Error("interaction is not an object");
+    const req = (it as Partial<Interaction>).request;
+    if (!req || typeof req !== "object" || typeof (req as { method?: unknown }).method !== "string") {
+      throw new Error("interaction.request.method must be a string");
+    }
+  }
+  return parsed as Cassette;
 }
