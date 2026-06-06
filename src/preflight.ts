@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { probeServer } from "./client";
+import { probeServer, PROBE_TIMEOUT_MS } from "./client";
 
 /**
  * The conservative set of environment variables a GUI-launched stdio MCP server
@@ -42,7 +42,7 @@ export async function preflight(
 ): Promise<PreflightResult> {
   const env = options.baseEnv ?? process.env;
   const allow = options.allowlist ?? GUI_INHERITED_DEFAULT;
-  const timeout = options.timeoutMs ?? 8000;
+  const timeout = options.timeoutMs ?? PROBE_TIMEOUT_MS;
 
   let fullEnvOk = true;
   let fullError: string | undefined;

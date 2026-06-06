@@ -103,6 +103,8 @@ mcpgaze wrap-http --port 7000 \
 
 Security defaults, baked in: binds to `127.0.0.1` only, and rejects cross-origin browser requests (DNS-rebinding defense — the class of bug behind the Inspector's CVE-2025-49596). `--host` and `--allow-origin` override, with a warning.
 
+**Credential scoping.** A single `--upstream`/`--route` forwards the client's `Authorization`/`Cookie` to that one upstream — there's only one destination, so a token can't be misrouted; pass `--no-forward-credentials` to strip them anyway. With **multiple** `--route`s a path could resolve to a different upstream than the client meant to authenticate to, so credentials — and `Set-Cookie`/`Mcp-Session-Id` on the way back — are **stripped unless that route opts in**: `--creds-route /github` per route, or `--forward-credentials` for all.
+
 ## `record` + `replay` — VCR for MCP
 
 Record a real session into a cassette, then replay it as a deterministic mock server with no backend — for offline client development and regression CI.

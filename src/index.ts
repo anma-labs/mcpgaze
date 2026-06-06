@@ -40,6 +40,14 @@ function hasFlag(opts: string[], name: string): boolean {
   return opts.includes(name);
 }
 
+/** Parse an optional positive-integer millisecond value from a flag/env value. */
+function parseTimeoutOpt(raw: string | undefined, name: string): number | undefined {
+  if (raw === undefined) return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) die(`${name} must be a positive number of milliseconds (got "${raw}")`);
+  return n;
+}
+
 function die(msg: string): never {
   process.stderr.write(color.red(msg) + "\n");
   process.exit(2);
@@ -68,7 +76,7 @@ const HELP = `mcpgaze v${VERSION} — a transparent wiretap for MCP servers
 USAGE
   mcpgaze wrap [--log <path>] [--print] [--redact] [--tui] [--native] -- <server command...>
   mcpgaze wrap-http (--upstream <url> | --route <prefix>=<url> ...) [--port <n>] [--host 127.0.0.1]
-                    [--forward-credentials | --creds-route <prefix> ...] [--redact]
+                    [--forward-credentials | --creds-route <prefix> ... | --no-forward-credentials] [--redact]
   mcpgaze record [--cassette mcpgaze.cassette.json] [--log <path>] [--no-redact] -- <server command...>
   mcpgaze replay --cassette <file>
   mcpgaze snapshot [--out mcpgaze.baseline.json] -- <server command...>
@@ -77,7 +85,7 @@ USAGE
   mcpgaze verify --cassette <file> [--fail-on <sev>] [--update] [--allow-tool-calls] -- <server command...>
   mcpgaze health [--interval <sec>] [--once] [--status <path>] -- <server command...>
   mcpgaze triage [--log <session.jsonl>] [--ai] [--yes] [--model <name>]
-  mcpgaze preflight [--config <file> [--server <name>]] [-- <server command...>]
+  mcpgaze preflight [--config <file> [--server <name>]] [--timeout <ms>] [-- <server command...>]
 
 COMMANDS
   wrap        Transparent stdio proxy; logs every JSON-RPC message to a side
@@ -86,8 +94,11 @@ COMMANDS
   wrap-http   Same idea for Streamable HTTP: localhost-bound, Origin-checked.
               Routes by path prefix, so one proxy can front several upstreams
               (--route /a=URL --route /b=URL); --upstream is the single-route form.
-              Client Authorization/Cookie are NOT forwarded to an upstream unless
-              you opt in (--creds-route /a, or --forward-credentials for all).
+              A single --upstream/--route forwards the client's Authorization/
+              Cookie to that one upstream (one destination, nothing to misroute);
+              add --no-forward-credentials to strip them. With MULTIPLE routes a
+              token could reach the wrong upstream, so credentials are stripped
+              unless a route opts in (--creds-route /a, or --forward-credentials).
   record      Wrap a server and write a replayable cassette of req/res pairs.
               Secrets are redacted by default (it is a shareable artifact);
               pass --no-redact to capture params/results/stderr verbatim.
@@ -179,11 +190,16 @@ async function cmdWrapHttp(args: string[]): Promise<void> {
   if (!upstream && routeSpecs.length === 0) {
     die("usage: mcpgaze wrap-http (--upstream <url> | --route <prefix>=<url> ...) [--port <n>] [--host 127.0.0.1]");
   }
+  const noForwardCredentials = hasFlag(opts, "--no-forward-credentials");
+  if (noForwardCredentials && (hasFlag(opts, "--forward-credentials") || getOpts(opts, "--creds-route").length > 0)) {
+    die("--no-forward-credentials cannot be combined with --forward-credentials or --creds-route");
+  }
   let routes;
   try {
     routes = buildRoutes(upstream, routeSpecs, {
       forwardCredentials: hasFlag(opts, "--forward-credentials"),
       credsPrefixes: getOpts(opts, "--creds-route"),
+      noForwardCredentials,
     });
   } catch (e) {
     die((e as Error).message);
@@ -266,9 +282,12 @@ async function cmdPreflight(args: string[]): Promise<void> {
     if (cmd.length === 0) return;
   }
 
-  if (cmd.length === 0) die("usage: mcpgaze preflight [--config <file>] [-- <server command...>]");
+  if (cmd.length === 0) die("usage: mcpgaze preflight [--config <file>] [--timeout <ms>] [-- <server command...>]");
+  // --timeout (or MCPGAZE_PREFLIGHT_TIMEOUT) overrides the handshake budget;
+  // preflight defaults to the shared probe timeout when unset.
+  const timeoutMs = parseTimeoutOpt(getOpt(opts, "--timeout") ?? process.env.MCPGAZE_PREFLIGHT_TIMEOUT, "--timeout");
   process.stderr.write(color.dim("[mcpgaze] probing with full env, then with the GUI-inherited subset…\n"));
-  const r = await preflight(cmd[0], cmd.slice(1));
+  const r = await preflight(cmd[0], cmd.slice(1), timeoutMs !== undefined ? { timeoutMs } : {});
 
   if (!r.fullEnvOk) {
     process.stdout.write(color.red("✗ the server failed to start even with your full environment.\n"));

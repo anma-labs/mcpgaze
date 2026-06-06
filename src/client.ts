@@ -3,6 +3,14 @@ import { VERSION } from "./version";
 
 export const PROTOCOL_VERSION = "2025-06-18";
 
+/**
+ * Default handshake/probe timeout (ms), shared so the probe-driven commands stay
+ * aligned: snapshot/diff (via probeServer) and preflight use the same budget, so
+ * a slow-cold-start server can't pass one and flake the other. Override per call,
+ * or for preflight via --timeout / MCPGAZE_PREFLIGHT_TIMEOUT.
+ */
+export const PROBE_TIMEOUT_MS = 15000;
+
 export interface ToolDef {
   name: string;
   description?: string;
@@ -28,7 +36,7 @@ export interface Probe {
 export async function probeServer(
   command: string,
   args: string[],
-  timeoutMs = 15000,
+  timeoutMs = PROBE_TIMEOUT_MS,
   env?: NodeJS.ProcessEnv,
 ): Promise<Probe> {
   const conn = McpConnection.spawn(command, args, env);

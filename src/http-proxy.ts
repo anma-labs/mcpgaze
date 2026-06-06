@@ -96,6 +96,8 @@ export interface BuildRoutesOptions {
   forwardCredentials?: boolean;
   /** Per-prefix opt-in to forward credentials (scoped to the upstream the operator trusts). */
   credsPrefixes?: string[];
+  /** Explicit opt-out: strip authorization/cookie on every route, even the single-route default. */
+  noForwardCredentials?: boolean;
 }
 
 /** Assemble routes from CLI inputs. `--route prefix=url` (repeatable) + --upstream. */
@@ -127,7 +129,11 @@ export function buildRoutes(
   // route there is no such boundary, so credentials flow as before. With several
   // routes, each forwards client/upstream credentials only if explicitly opted in
   // (--forward-credentials for all, or --creds-route <prefix> per route).
-  if (routes.length === 1) {
+  // --no-forward-credentials is an explicit opt-out that strips on every route,
+  // including the single-route default.
+  if (opts.noForwardCredentials) {
+    for (const r of routes) r.forwardCredentials = false;
+  } else if (routes.length === 1) {
     routes[0].forwardCredentials = true;
   } else {
     for (const r of routes) {
