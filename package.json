@@ -1,0 +1,43 @@
+{
+  "name": "mcpgaze",
+  "version": "1.0.0",
+  "description": "A transparent wiretap for MCP servers. See exactly what your AI client sends your server — without breaking the protocol — and catch tool-schema drift in CI.",
+  "type": "module",
+  "bin": {
+    "mcpgaze": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --target node18 --clean",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test src/test/*.test.ts",
+    "test:fuzz": "node --import tsx --test src/test/fuzz.test.ts",
+    "harden": "npm run build && node scripts/diff-proxies.mjs --corpus scripts/corpus --repeat 10 && node scripts/wire-integrity.mjs && node scripts/dogfood.mjs",
+    "dev": "tsx src/index.ts"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "debugging",
+    "proxy",
+    "observability",
+    "schema-drift",
+    "cli",
+    "ai-agents",
+    "llm-tools"
+  ],
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@types/node": "^20.14.0",
+    "tsup": "^8.3.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0",
+    "zod": "^3.23.0"
+  }
+}

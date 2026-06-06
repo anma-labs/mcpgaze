@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  rust:
+    name: rust proxy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - working-directory: native/mcpgaze-proxy
+        run: |
+          cargo fmt --check
+          cargo build --release
+      # Advisory: clippy lints surface in the log but don't block (the binary is
+      # std-only and builds warning-free; tighten to `-D warnings` once green).
+      - name: clippy (advisory)
+        continue-on-error: true
+        working-directory: native/mcpgaze-proxy
+        run: rustup component add clippy && cargo clippy --release -- -D warnings
+
+  harden:
+    name: dynamic hardening workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      - run: npm run build
+      - name: Build native proxy (for the differential oracle)
+        working-directory: native/mcpgaze-proxy
+        run: cargo build --release
+      - name: Fuzz the framing/observer invariants
+        run: npm run test:fuzz
+      - name: Differential oracle (Node vs Rust proxy agree)
+        run: node scripts/diff-proxies.mjs --corpus scripts/corpus --repeat 10
+      - name: Wire integrity (random binary forwarded byte-exact)
+        run: node scripts/wire-integrity.mjs
+      - name: Dogfood (mcpgaze conforms its own replay server)
+        run: node scripts/dogfood.mjs

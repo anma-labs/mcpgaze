@@ -1,0 +1,65 @@
+name: Release
+
+# On a version tag, build the native proxy for each platform and attach the
+# binaries to the GitHub Release, so `mcpgaze wrap --native` works without cargo.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  native-binaries:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        working-directory: native/mcpgaze-proxy
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        working-directory: native/mcpgaze-proxy
+        run: |
+          BIN=target/${{ matrix.target }}/release/mcpgaze-proxy
+          tar -czf mcpgaze-proxy-${{ matrix.target }}.tar.gz -C "$(dirname "$BIN")" mcpgaze-proxy
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        working-directory: native/mcpgaze-proxy
+        run: |
+          Compress-Archive -Path target/${{ matrix.target }}/release/mcpgaze-proxy.exe -DestinationPath mcpgaze-proxy-${{ matrix.target }}.zip
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            native/mcpgaze-proxy/mcpgaze-proxy-${{ matrix.target }}.tar.gz
+            native/mcpgaze-proxy/mcpgaze-proxy-${{ matrix.target }}.zip
+
+  npm-publish:
+    name: publish to npm
+    needs: native-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.mcpgaze/
+*.log
+.DS_Store
+native/**/target/
+Cargo.lock
