@@ -137,7 +137,17 @@ export function runProxy(opts: WrapOptions): Promise<number> {
     // a wrapping client still sees the server's logs exactly as before, and we
     // also record it (correlated by time) in the structured log.
     child.stderr.on("data", (chunk: Buffer) => {
-      if (opts.mirrorStderr !== false) process.stderr.write(chunk);
+      if (opts.mirrorStderr !== false) {
+        try {
+          process.stderr.write(chunk);
+        } catch (e) {
+          // Mirror is an observer: a synchronous throw here (e.g.
+          // ERR_STREAM_DESTROYED after our stderr reader vanished mid-flood and
+          // the async 'error' already destroyed the stream) must never tear down
+          // the wire. Route it like the c2s/s2c observer paths.
+          opts.logger.note("observer-error", `stderr-mirror ${(e as Error).message}`);
+        }
+      }
       opts.logger.serverStderr(chunk.toString("utf8"));
     });
 
