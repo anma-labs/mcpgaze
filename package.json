@@ -30,7 +30,8 @@
     "test:fuzz": "node --import tsx --test src/test/fuzz.test.ts",
     "harden": "npm run build && node scripts/diff-proxies.mjs --corpus scripts/corpus --repeat 10 && node scripts/wire-integrity.mjs && node scripts/dogfood.mjs",
     "dev": "tsx src/index.ts",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "pretest": "npm run build"
   },
   "keywords": [
     "mcp",
