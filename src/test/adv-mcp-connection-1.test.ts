@@ -70,10 +70,21 @@ process.exit(0);
   child.stdout.on("data", (c: Buffer) => (stdout += c.toString("utf8")));
   child.stderr.on("data", (c: Buffer) => (stderr += c.toString("utf8")));
 
+  // Wait on 'close', not 'exit'. 'exit' fires the moment the harness process
+  // terminates, but does NOT guarantee we have drained its stdout/stderr — so
+  // asserting on `stdout` ("CLEAN") races delivery of the final chunk and flakes.
+  // 'close' fires only after the child has exited AND both pipes are fully read,
+  // making the captured output deterministic. The timer is now a hang backstop
+  // only: generous so a slow `node --import tsx` cold start under CI load is never
+  // SIGKILLed mid-flight (the old 5000ms window did exactly that — observed at
+  // 5344ms), and cleared on close so it never fires for a healthy run.
   const result = await new Promise<{ code: number | null; signal: string | null }>(
     (resolve) => {
-      child.on("exit", (code, signal) => resolve({ code, signal }));
-      setTimeout(() => child.kill("SIGKILL"), 5000);
+      const watchdog = setTimeout(() => child.kill("SIGKILL"), 30000);
+      child.on("close", (code, signal) => {
+        clearTimeout(watchdog);
+        resolve({ code, signal });
+      });
     },
   );
 

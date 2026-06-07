@@ -1,9 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
-import { readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { runHttpProxy, isAllowedOrigin, resolveRoute, buildTarget, matchRemainder, buildRoutes, routeFromUpstream, type HttpProxyHandle } from "../http-proxy";
 import { Logger } from "../logger";
 
@@ -81,8 +78,26 @@ function startUpstream(): Promise<{ server: Server; url: string }> {
 
 test("proxies a JSON response byte-exact and observes it", async () => {
   const up = await startUpstream();
-  const logPath = join(tmpdir(), `mcpgaze-http-${Date.now()}.jsonl`);
-  const logger = new Logger({ jsonlPath: logPath });
+  // Capture observations via onEvent (synchronous, in-process) instead of reading
+  // the async JSONL after a fixed delay. For a non-SSE response the proxy forwards
+  // byte-exact and ends the response BEFORE observing s2c (invariant A: forward
+  // first), so the s2c event can land just after res.text() resolves — wait on the
+  // deterministic onEvent signal rather than a fixed window.
+  const observed: Array<Record<string, unknown>> = [];
+  let onObserve = () => {};
+  const logger = new Logger({ onEvent: (ev) => { observed.push(ev); onObserve(); } });
+  const until = (pred: () => boolean, ms = 5000): Promise<void> =>
+    pred()
+      ? Promise.resolve()
+      : new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => {
+            onObserve = () => {};
+            reject(new Error(`timed out waiting for observation: ${JSON.stringify(observed)}`));
+          }, ms);
+          onObserve = () => {
+            if (pred()) { clearTimeout(timer); onObserve = () => {}; resolve(); }
+          };
+        });
   let proxy: HttpProxyHandle | undefined;
   try {
     proxy = await runHttpProxy({ routes: [routeFromUpstream(up.url)], host: "127.0.0.1", port: 0, logger });
@@ -95,23 +110,40 @@ test("proxies a JSON response byte-exact and observes it", async () => {
     assert.equal(res.headers.get("mcp-session-id"), "sess-123");
     assert.deepEqual(JSON.parse(text), { jsonrpc: "2.0", id: 1, result: { tools: [] } });
 
-    await new Promise((r) => setTimeout(r, 50));
-    const log = readFileSync(logPath, "utf8");
-    assert.match(log, /"method":"tools\/list"/);
-    assert.match(log, /"dir":"c2s"/);
-    assert.match(log, /"dir":"s2c"/);
-    assert.match(log, /sess-123/); // session-id note recorded
+    // The s2c response is recorded just after the response is ended; the c2s
+    // request and the session note land no later. Wait on that deterministic
+    // signal, then assert the same facts the JSONL check used to.
+    await until(() => observed.some((e) => e.type === "message" && e.dir === "s2c"));
+    const msgs = observed.filter((e) => e.type === "message");
+    assert.ok(
+      msgs.some((e) => e.dir === "c2s" && e.method === "tools/list"),
+      `expected the tools/list request observed c2s; got ${JSON.stringify(msgs)}`,
+    );
+    assert.ok(
+      msgs.some((e) => e.dir === "s2c"),
+      `expected the response observed s2c; got ${JSON.stringify(msgs)}`,
+    );
+    assert.ok(
+      observed.some((e) => e.type === "note" && typeof e.detail === "string" && (e.detail as string).includes("sess-123")),
+      `expected the session-id note recorded; got ${JSON.stringify(observed)}`,
+    );
   } finally {
     await proxy?.close();
     up.server.close();
-    rmSync(logPath, { force: true });
   }
 });
 
 test("proxies an SSE stream and observes each event", async () => {
   const up = await startUpstream();
-  const logPath = join(tmpdir(), `mcpgaze-sse-${Date.now()}.jsonl`);
-  const logger = new Logger({ jsonlPath: logPath });
+  // Deterministic signal: capture observations via the logger's onEvent hook,
+  // which fires synchronously inside the proxy's SSE read loop (sse.push →
+  // observe → logger.message → onEvent) BEFORE the response is ended. So by the
+  // time `res.text()` resolves, every event the proxy observed is already in
+  // `observed`. The old check read the JSONL after a fixed 50ms — but the write
+  // stream is async, so under load the file wasn't even created yet (ENOENT) /
+  // not flushed within the window. onEvent removes the race at its source.
+  const observed: Array<Record<string, unknown>> = [];
+  const logger = new Logger({ onEvent: (ev) => observed.push(ev) });
   let proxy: HttpProxyHandle | undefined;
   try {
     proxy = await runHttpProxy({ routes: [routeFromUpstream(up.url)], host: "127.0.0.1", port: 0, logger });
@@ -125,16 +157,19 @@ test("proxies an SSE stream and observes each event", async () => {
     assert.match(body, /data: /); // SSE framing forwarded intact
     assert.match(body, /"part":1/);
 
-    await new Promise((r) => setTimeout(r, 50));
-    const log = readFileSync(logPath, "utf8");
-    // Both the result event and the progress notification should be observed s2c.
-    // (In the JSONL, raw payloads are JSON-escaped, so match unquoted substrings.)
-    assert.match(log, /part/);
-    assert.match(log, /notifications\/progress/);
+    // Both the result event and the progress notification must be observed s2c.
+    const s2c = observed.filter((e) => e.type === "message" && e.dir === "s2c");
+    assert.ok(
+      s2c.some((e) => typeof e.raw === "string" && (e.raw as string).includes('"part":1')),
+      `expected the SSE result event observed s2c; got ${JSON.stringify(s2c)}`,
+    );
+    assert.ok(
+      s2c.some((e) => e.method === "notifications/progress"),
+      `expected the progress notification observed s2c; got ${JSON.stringify(s2c)}`,
+    );
   } finally {
     await proxy?.close();
     up.server.close();
-    rmSync(logPath, { force: true });
   }
 });
 
