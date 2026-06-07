@@ -40,7 +40,7 @@ npm install && npm run build
 node dist/index.js --help
 ```
 
-> Once published, this becomes `npx mcpgaze --help` / `npm i -g mcpgaze`. Until then, substitute `node /abs/path/to/mcpgaze/dist/index.js` everywhere this README writes `mcpgaze`. See [Getting Started](./docs/getting-started.md) for the full setup, including a `mcpgaze` shell alias.
+> Once published, this becomes `npx @anma-labs/mcpgaze --help` / `npm i -g @anma-labs/mcpgaze`. Until then, substitute `node /abs/path/to/mcpgaze/dist/index.js` everywhere this README writes `mcpgaze`. See [Getting Started](./docs/getting-started.md) for the full setup, including a `mcpgaze` shell alias.
 
 **Watch a live session:**
 

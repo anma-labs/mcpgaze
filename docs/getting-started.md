@@ -35,7 +35,7 @@ alias mcpgaze='node /abs/path/to/mcpgaze/dist/index.js'
 alias --save mcpgaze='node /abs/path/to/mcpgaze/dist/index.js'
 ```
 
-Now `mcpgaze --help` works anywhere. (Once the package is published, `npm i -g mcpgaze` will install a real `mcpgaze` binary and you can drop the alias.)
+Now `mcpgaze --help` works anywhere. (Once the package is published, `npm i -g @anma-labs/mcpgaze` will install a real `mcpgaze` binary and you can drop the alias.)
 
 > **In client configs**, prefer the full, absolute invocation — GUI clients don't load your shell aliases. Use `"command": "node", "args": ["/abs/.../dist/index.js", "wrap", "--", ...]`.
 

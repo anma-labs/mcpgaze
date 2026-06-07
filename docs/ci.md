@@ -2,7 +2,7 @@
 
 `mcpgaze` is built to fail your build the moment an MCP server's contract changes. These are drop-in recipes; adapt the server command and paths to your project.
 
-Throughout, `mcpgaze` is invoked as `node dist/index.js` because the package isn't on npm yet. Once it is, replace that with `npx mcpgaze`.
+Throughout, `mcpgaze` is invoked as `node dist/index.js` because the package isn't on npm yet. Once it is, replace that with `npx @anma-labs/mcpgaze`.
 
 ## The core idea
 
@@ -31,7 +31,7 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 22, cache: npm }
 
-      # Build mcpgaze (skip once it's published: use `npx mcpgaze` instead)
+      # Build mcpgaze (skip once it's published: use `npx @anma-labs/mcpgaze` instead)
       - run: npm ci && npm run build
         working-directory: tools/mcpgaze   # wherever you vendor it
 
@@ -125,7 +125,7 @@ node /abs/path/to/mcpgaze/dist/index.js diff --fail-on-drift -- node server.js |
 
 ## Tips
 
-- **Vendor vs. install.** Until `mcpgaze` is on npm, either add it as a git submodule / vendored `tools/mcpgaze`, or build it in a prior CI step. Once published, `npx mcpgaze@<version>` pins a version with no build step.
+- **Vendor vs. install.** Until `mcpgaze` is on npm, either add it as a git submodule / vendored `tools/mcpgaze`, or build it in a prior CI step. Once published, `npx @anma-labs/mcpgaze@<version>` pins a version with no build step.
 - **Pin protocol versions** you actually support with `conform --spec <ver>` so a new RC doesn't surprise your gate.
 - **Artifacts.** Pipe `--json` output (`conform`, or parse `diff` output) into a job artifact for a historical record.
 - **Exit codes** are the contract — see the [exit-code table](./commands.md#exit-codes).

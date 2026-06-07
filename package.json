@@ -1,6 +1,6 @@
 {
-  "name": "mcpgaze",
-  "version": "1.0.0",
+  "name": "@anma-labs/mcpgaze",
+  "version": "1.0.1",
   "description": "A transparent wiretap for MCP servers. See exactly what your AI client sends your server — without breaking the protocol — and catch tool-schema drift in CI.",
   "repository": {
     "type": "git",
@@ -52,5 +52,8 @@
     "tsx": "^4.19.0",
     "typescript": "^5.5.0",
     "zod": "^3.23.0"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
