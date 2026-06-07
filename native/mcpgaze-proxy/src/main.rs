@@ -215,11 +215,9 @@ fn scan_top_level(line: &str) -> TopLevel {
                     }
                 }
             }
-            ',' => {
-                if depth == 1 {
-                    expect_key = true;
-                    pending_key = None;
-                }
+            ',' if depth == 1 => {
+                expect_key = true;
+                pending_key = None;
             }
             _ => {}
         }
