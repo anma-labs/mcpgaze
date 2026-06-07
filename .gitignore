@@ -9,3 +9,7 @@ Cargo.lock
 # commit them by default (record with --redact, or curate before sharing).
 mcpgaze.cassette.json
 *.cassette.json
+
+# Cassettes may contain captured request/response data — never commit
+*.cassette.json
+mcpgaze.cassette.json

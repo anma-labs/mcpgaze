@@ -81,7 +81,7 @@ Still: only run `verify --allow-tool-calls` against a cassette you trust, and ag
 
 `mcpgaze` v1.0.0 underwent a source-level red-team audit with reproducible proof-of-concept exploits. Result: **0 critical, 0 high, 3 medium, 2 low** — all remediated or consciously mitigated (the medium findings were secret-at-rest and triage-egress governance; the low findings were the credential-scoping and untrusted-cassette surfaces described above). Several attack classes (SSRF/DNS-rebinding via routing or redirects, cassette parser crashes, prototype pollution) were probed and found defended.
 
-The full report, the remediation status table, and self-contained PoCs live under [`security-audit/`](./security-audit/) (`REPORT.md`, `MATRIX-REPORT.md`).
+Findings and remediation status are summarized in the [CHANGELOG](./CHANGELOG.md). The proof-of-concept exploit scripts are retained privately rather than published, since they include runnable attack code.
 
 ## Accepted, documented limitations
 
